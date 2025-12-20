@@ -43,7 +43,13 @@ export interface IssueVcResult {
   vc: RawVerifiableCredential;
 }
 
-const BBS_BASE_URL = process.env.ZK_SERVICE_URL || "http://localhost:5005";
+const BBS_BASE_URL = process.env.ZK_SERVICE_URL;
+
+if (!BBS_BASE_URL && process.env.NODE_ENV === "production") {
+  throw new Error("ZK_SERVICE_URL is required in production (Railway).");
+}
+
+const BBS_URL = BBS_BASE_URL || "http://localhost:5005";
 
 async function callBbsIssue(
   unsignedVc: Omit<RawVerifiableCredential, "proof">,
@@ -78,7 +84,7 @@ async function callBbsIssue(
     publicHasX: !!publicKeyJwk.x,
   });
 
-  const res = await fetch(`${BBS_BASE_URL}/bbs/issue`, {
+  const res = await fetch(`${BBS_URL}/bbs/issue`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

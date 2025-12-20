@@ -13,14 +13,19 @@ export interface ZkVerifyVcOutput {
   reason?: string;
 }
 
-const ZK_BASE_URL =
-  process.env.ZK_SERVICE_URL || "http://localhost:5005";
+const ZK_BASE_URL = process.env.ZK_SERVICE_URL;
+
+if (!ZK_BASE_URL && process.env.NODE_ENV === "production") {
+  throw new Error("ZK_SERVICE_URL is required in production (Railway).");
+}
+
+const ZK_URL = ZK_BASE_URL || "http://127.0.0.1:5005";
 
 /**
  * Internal helper: POST JSON to the BBS+ microservice.
  */
 async function postJson<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${ZK_BASE_URL}${path}`, {
+  const res = await fetch(`${ZK_URL}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
