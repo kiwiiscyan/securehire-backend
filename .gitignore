@@ -1,0 +1,10 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Framework-specific
+.next/
+dist/
+build/
+node_modules/
