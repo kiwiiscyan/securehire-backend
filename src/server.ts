@@ -2,6 +2,7 @@
 import "dotenv/config";
 import express, { Express } from "express";
 import cors from "cors";
+import { requireInternalKey } from "./middleware/requireInternalKey";
 import mongoose, { connectMongo } from "./config/mongo";
 import swaggerUi from "swagger-ui-express";
 import swaggerSpec from "./config/swagger";
@@ -19,13 +20,15 @@ export function createApp(routers: {
 
   app.use(
     cors({
-      origin: process.env.CORS_ORIGIN || "*",
+      origin: process.env.CORS_ORIGIN,
       credentials: true,
     })
   );
   app.use(express.json({ limit: "2mb" }));
 
   app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
+  app.use("/api/v1", requireInternalKey);
 
   app.use("/api/v1/jobs", routers.jobsRouter);
   app.use("/api/v1/seekers", routers.seekersRouter);
