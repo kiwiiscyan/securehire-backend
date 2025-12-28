@@ -1,3 +1,4 @@
+//src/routes/applications.ts
 import { Router } from 'express';
 import Application from '../models/Application';
 import SharedProof from "../models/Proofs";
@@ -5,8 +6,11 @@ import Credential from "../models/Credential";
 import Job from "../models/Jobs";
 import Seeker from "../models/Seeker";
 import Recruiter from "../models/Recruiter";
+import { requireSession, getSession } from "../middleware/requireSession";
 
 const router = Router();
+
+router.use(requireSession);
 
 // ✅ FIX: Clean VC helper - removes nested @context
 function cleanVcForStorage(vc: any): any {
@@ -108,6 +112,18 @@ function deepCloneVcRawUntouched(vcRaw: any) {
   return JSON.parse(JSON.stringify(vcRaw));
 }
 
+function mustGetDid(req: any): string {
+  const s = getSession(req);
+  const did = String(s?.did || "").trim();
+  if (!did) throw new Error("Unauthenticated");
+  return did;
+}
+
+function isOwnerOfApplication(sessionDid: string, app: any) {
+  const did = sessionDid.trim();
+  return did === String(app.seekerDid) || did === String(app.recruiterDid);
+}
+
 /**
  * @openapi
  * /applications:
@@ -117,9 +133,16 @@ function deepCloneVcRawUntouched(vcRaw: any) {
  */
 router.post('/', async (req, res) => {
   try {
-    const { jobId, seekerDid, recruiterDid, sharedVcIds } = req.body;
-    if (!jobId || !seekerDid || !recruiterDid) {
-      return res.status(400).json({ error: 'jobId, seekerDid, recruiterDid required' });
+    const s = getSession(req);
+    if (!s?.did) return res.status(401).json({ error: "Unauthenticated" });
+
+    const { jobId, recruiterDid, sharedVcIds } = req.body;
+
+    // ✅ seekerDid must come from session, not body
+    const seekerDid = String(s.did).trim();
+
+    if (!jobId || !recruiterDid) {
+      return res.status(400).json({ error: "jobId, recruiterDid required" });
     }
 
     // Prevent duplicate applications for the same seeker + job
@@ -233,8 +256,16 @@ router.post('/', async (req, res) => {
  *     tags: [Applications]
  */
 router.get('/by-seeker', async (req, res) => {
-  const seekerDid = String(req.query.seekerDid || '');
-  if (!seekerDid) return res.status(400).json({ error: 'seekerDid required' });
+  const s = getSession(req);
+  if (!s) return res.status(401).json({ error: "Unauthenticated" });
+
+  const seekerDid = String(s.did).trim();
+  if (!seekerDid) return res.status(401).json({ error: "Missing DID in session" });
+
+  const sessionDid = String(s.did || "").trim();
+  if (sessionDid && sessionDid !== seekerDid) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
 
   const list = await Application.find({ seekerDid }).sort({ createdAt: -1 }).lean();
 
@@ -272,9 +303,12 @@ router.get('/by-seeker', async (req, res) => {
  */
 router.get("/by-recruiter", async (req, res) => {
   try {
-    const recruiterDid = String(req.query.recruiterDid || "");
-    if (!recruiterDid) {
-      return res.status(400).json({ error: "recruiterDid required" });
+    const s = getSession(req);
+    if (!s?.did) return res.status(401).json({ error: "Unauthenticated" });
+
+    const recruiterDid = String(s.did).trim();
+    if (req.query?.recruiterDid) {
+      return res.status(400).json({ error: "Do not send recruiterDid. Session-only." });
     }
 
     const list = await Application.find({ recruiterDid })
@@ -346,9 +380,18 @@ router.get("/by-recruiter", async (req, res) => {
  */
 router.get("/by-job", async (req, res) => {
   try {
+    const sessionDid = mustGetDid(req);
+
     const jobId = String(req.query.jobId || "");
     if (!jobId) {
       return res.status(400).json({ error: "jobId required" });
+    }
+
+    const job = await Job.findById(jobId).lean();
+    if (!job) return res.status(404).json({ error: "Job not found" });
+
+    if (String((job as any).didOwner || "") !== sessionDid) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
     const apps = await Application.find({ jobId })
@@ -418,9 +461,14 @@ router.get("/:id", async (req, res) => {
   const { id } = req.params;
 
   try {
+    const sessionDid = mustGetDid(req);
+
     const app = await Application.findById(id).lean();
     if (!app) return res.status(404).json({ error: "Application not found" });
 
+    if (!isOwnerOfApplication(sessionDid, app)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
 
     const recruiter = await Recruiter.findOne({ did: app.recruiterDid }).lean();
     const job = await Job.findById(app.jobId).lean();
@@ -501,6 +549,8 @@ router.get("/:id", async (req, res) => {
 // PATCH /applications/:id/status
 router.patch("/:id/status", async (req, res) => {
   try {
+    const sessionDid = mustGetDid(req);
+
     const { id } = req.params;
     const { status, interview } = req.body as {
       status?: "submitted" | "withdrawn" | "shortlisted" | "rejected" | "hired";
@@ -511,6 +561,10 @@ router.patch("/:id/status", async (req, res) => {
 
     const app = await Application.findById(id);
     if (!app) return res.status(404).json({ error: "Application not found" });
+
+    if (String(app.recruiterDid) !== sessionDid) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
 
     app.status = status;
     if (interview) {
@@ -528,11 +582,22 @@ router.patch("/:id/status", async (req, res) => {
 // PATCH /applications/:id/shared-vcs
 router.patch("/:id/shared-vcs", async (req, res) => {
   try {
+    const sessionDid = mustGetDid(req);
+
     const { id } = req.params;
     const { sharedVcIds } = req.body as { sharedVcIds?: string[] };
 
     const app = await Application.findById(id);
     if (!app) return res.status(404).json({ error: "Application not found" });
+
+    if (String(app.seekerDid) !== sessionDid) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    // Optional: only allow while submitted
+    if (app.status !== "submitted") {
+      return res.status(409).json({ error: "Cannot edit shared VCs after review begins" });
+    }
 
     const requested: string[] = Array.isArray(sharedVcIds) ? sharedVcIds : [];
 

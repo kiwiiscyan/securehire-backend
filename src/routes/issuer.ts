@@ -11,8 +11,12 @@ import {
   VcSection,
 } from "../services/vc.service";
 import { ensureBbsKeyForIssuer } from "../services/bbsKey.service";
+import { requireSession } from "../middleware/requireSession";
+import { mustGetSession, mustGetDid, mustGetEmail } from "../auth/identity";
 
 const router = Router();
+
+router.use(requireSession);
 
 /**
  * Helper type: per-section structured claims that also carries credentialType.
@@ -172,12 +176,22 @@ function toRecruiterApi(doc: IRecruiter) {
  */
 router.post("/vc/issue", async (req: Request, res: Response) => {
   try {
-    const { issuerDid, subjectDid, claims } = req.body;
-    if (!issuerDid || !subjectDid || !claims) {
-      return res
-        .status(400)
-        .json({ error: "issuerDid, subjectDid, claims are required" });
+    const s = mustGetSession(req);
+    const did = s.did?.trim();
+    const email = s.email?.trim().toLowerCase();
+
+    const issuer =
+      (did && (await Issuer.findOne({ did }))) ||
+      (email && (await Issuer.findOne({ email })));
+
+    if (!issuer) return res.status(404).json({ error: "Issuer not found" });
+
+    const { subjectDid, claims } = req.body;
+    if (!subjectDid || !claims) {
+      return res.status(400).json({ error: "subjectDid and claims are required" });
     }
+
+    const issuerDid = issuer.did;
 
     const section =
       (claims.section as "career" | "education" | "certification" | "recruiter") ??
@@ -227,23 +241,20 @@ router.post("/vc/issue", async (req: Request, res: Response) => {
  */
 router.get("/vc", async (req, res) => {
   try {
-    const { issuerDid } = req.query as { issuerDid?: string };
+    const s = mustGetSession(req);
+    const did = s.did?.trim();
+    const email = s.email?.trim().toLowerCase();
 
-    const filter: any = {};
-    if (issuerDid) {
-      filter.issuerDid = issuerDid;
-    }
+    const issuer =
+      (did && (await Issuer.findOne({ did }).lean())) ||
+      (email && (await Issuer.findOne({ email }).lean()));
 
-    const creds = await Credential.find(filter)
-      .sort({ createdAt: -1 })
-      .lean();
+    if (!issuer) return res.status(404).json({ error: "Issuer not found" });
 
-    return res.json({
-      items: creds,
-    });
-  } catch (err) {
-    console.error("GET /issuer/vc error:", err);
-    return res.status(500).json({ error: "Failed to list issuer credentials" });
+    const creds = await Credential.find({ issuerDid: issuer.did }).sort({ createdAt: -1 }).lean();
+    return res.json({ items: creds });
+  } catch (e) {
+    return res.status(401).json({ error: "Unauthenticated" });
   }
 });
 
@@ -356,7 +367,7 @@ router.post("/vc/revoke", async (req, res) => {
  */
 router.get("/requests", async (req, res) => {
   try {
-    const { issuerDid } = req.query as { issuerDid?: string };
+    const issuerDid = mustGetDid(req);
 
     const seekers = await Seeker.find({
       pendingVcRequests: { $exists: true, $ne: [] },
@@ -365,7 +376,7 @@ router.get("/requests", async (req, res) => {
     const allRequests: any[] = [];
     for (const seeker of seekers) {
       for (const r of seeker.pendingVcRequests || []) {
-        if (issuerDid && r.issuerDid !== issuerDid) continue;
+        if (r.issuerDid !== issuerDid) continue;
 
         allRequests.push({
           requestId: r.id,
@@ -420,19 +431,21 @@ router.post(
   async (req: Request, res: Response) => {
     try {
       const { requestId } = req.params;
+      /*
       const { issuerDid, seekerDid, section } = req.body as {
         issuerDid: string;
         seekerDid: string;
         section: "career" | "education" | "certification";
       };
+      */
+      const issuerDid = mustGetDid(req);
+      const { section } = req.body;
 
-      if (!issuerDid || !seekerDid || !section) {
-        return res
-          .status(400)
-          .json({ error: "issuerDid, seekerDid, section required" });
-      }
+      const seeker = await Seeker.findOne({
+        "pendingVcRequests.id": requestId,
+      });
 
-      const seeker = await Seeker.findOne({ did: seekerDid });
+      //const seeker = await Seeker.findOne({ did: seekerDid });
       if (!seeker) return res.status(404).json({ error: "Seeker not found" });
 
       const reqIdx = seeker.pendingVcRequests?.findIndex(
@@ -443,6 +456,18 @@ router.post(
       }
 
       const reqEntry = seeker.pendingVcRequests![reqIdx];
+
+      if (reqEntry.issuerDid !== issuerDid) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      const seekerDid = seeker.did;
+
+      if (!issuerDid || !seekerDid || !section) {
+        return res
+          .status(400)
+          .json({ error: "issuerDid, seekerDid, section required" });
+      }
 
       // find the profile entry that matches the requested title
       let profileEntry;
@@ -551,6 +576,7 @@ router.post("/requests/:requestId/reject", async (req, res) => {
   try {
     const { requestId } = req.params;
     const { reason } = req.body || {};
+    const issuerDid = mustGetDid(req);
 
     const seeker = await Seeker.findOne({
       "pendingVcRequests.id": requestId,
@@ -564,6 +590,10 @@ router.post("/requests/:requestId/reject", async (req, res) => {
     const requestEntry = pendingList.find((r: any) => r.id === requestId);
     if (!requestEntry) {
       return res.status(404).json({ error: "Request not found" });
+    }
+
+    if (requestEntry.issuerDid !== issuerDid) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
     requestEntry.status = "rejected";
@@ -604,10 +634,18 @@ router.post("/requests/:requestId/reject", async (req, res) => {
  */
 router.get("/recruiters/pending", async (req: Request, res: Response) => {
   try {
-    const { issuerDid } = req.query as { issuerDid?: string };
+    // const { issuerDid } = req.query as { issuerDid?: string };
 
     let orgNameFilter: string | undefined;
 
+    const issuerDid = mustGetDid(req);
+    const issuer = await Issuer.findOne({ did: issuerDid });
+    if (issuer?.orgName) {
+      // normalize: lowercase + remove spaces 
+      orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
+    }
+
+    /*
     if (issuerDid) {
       const issuer = await Issuer.findOne({ did: issuerDid });
       if (issuer?.orgName) {
@@ -615,6 +653,7 @@ router.get("/recruiters/pending", async (req: Request, res: Response) => {
         orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
       }
     }
+      */
 
     const recruitersRaw = await Recruiter.find({ kycStatus: "pending" });
     const filtered = recruitersRaw.filter(r => {
@@ -640,16 +679,24 @@ router.get("/recruiters/pending", async (req: Request, res: Response) => {
  */
 router.get("/recruiters/badges", async (req: Request, res: Response) => {
   try {
-    const { issuerDid } = req.query as { issuerDid?: string };
+    //const { issuerDid } = req.query as { issuerDid?: string };
 
     let orgNameFilter: string | undefined;
 
+    const issuerDid = mustGetDid(req);
+    const issuer = await Issuer.findOne({ did: issuerDid });
+    if (issuer?.orgName) {
+      orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
+    }
+
+    /*
     if (issuerDid) {
       const issuer = await Issuer.findOne({ did: issuerDid });
       if (issuer?.orgName) {
         orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
       }
     }
+    */
 
     const recruitersRaw = await Recruiter.find({
       kycStatus: { $in: ["rejected", "approved"] }
@@ -682,12 +729,13 @@ router.post("/recruiters/:id/approve", async (req: Request, res: Response) => {
     const recruiterId = req.params.id;
 
     // Whoever hits this endpoint is the issuer → get DID from DB
-    const issuer = await Issuer.findOne({ did: req.body.issuerDid });
+    //const issuer = await Issuer.findOne({ did: req.body.issuerDid });
+    const issuerDid = mustGetDid(req);
+    const issuer = await Issuer.findOne({ did: issuerDid });
     if (!issuer) {
       return res.status(400).json({ error: "Issuer not found" });
     }
 
-    const issuerDid = issuer.did;                 // ✔ correct DID
     const recruiter = await Recruiter.findById(recruiterId);
 
     if (!recruiter) {
@@ -787,37 +835,21 @@ router.post("/recruiters/:id/reject", async (req: Request, res: Response) => {
  */
 router.get("/me", async (req, res) => {
   try {
-    const { email, did } = req.query as { email?: string; did?: string };
+    const s = mustGetSession(req);
+    const did = s.did?.trim();
+    const email = s.email?.trim().toLowerCase();
 
-    if (!email && !did) {
-      return res
-        .status(400)
-        .json({ error: "email or did query param is required" });
-    }
+    const issuerDoc0 =
+      (did && (await Issuer.findOne({ did }))) ||
+      (email && (await Issuer.findOne({ email })));
 
-    // Prefer email as login identifier; did is only a fallback.
-    const query: any = {};
-    if (email) {
-      query.email = String(email).toLowerCase();
-    } else if (did) {
-      query.did = did;
-    }
+    if (!issuerDoc0) return res.status(404).json({ error: "Issuer not found" });
 
-    let issuerDoc = await Issuer.findOne(query);
-    if (!issuerDoc) {
-      return res.status(404).json({ error: "Issuer not found" });
-    }
-
-    // 🔐 Ensure this issuer has a canonical BBS+ DID + keys.
-    // This will:
-    //  - generate Ed25519 keypair if missing
-    //  - derive did:key from the JWK
-    //  - set issuer.did = did:key
-    issuerDoc = await ensureBbsKeyForIssuer(issuerDoc);
+    const issuerDoc = await ensureBbsKeyForIssuer(issuerDoc0);
 
     return res.json({
       id: issuerDoc._id.toString(),
-      did: issuerDoc.did, // canonical did:key DID
+      did: issuerDoc.did,
       email: issuerDoc.email,
       name: issuerDoc.name,
       orgName: issuerDoc.orgName,
@@ -825,12 +857,10 @@ router.get("/me", async (req, res) => {
       onboarded: issuerDoc.onboarded ?? false,
       hasBbsKey: Boolean(issuerDoc.bbsVerificationMethodId),
     });
-  } catch (err) {
-    console.error("GET /issuer/me error:", err);
-    return res.status(500).json({ error: "Failed to load issuer profile" });
+  } catch (e) {
+    return res.status(401).json({ error: "Unauthenticated" });
   }
 });
-
 
 /**
  * POST /issuer/onboard
@@ -845,6 +875,7 @@ router.get("/me", async (req, res) => {
  */
 router.post("/onboard", async (req, res) => {
   try {
+    /*
     const {
       email,
       did,
@@ -860,6 +891,12 @@ router.post("/onboard", async (req, res) => {
       orgType?: "company" | "university" | "certBody";
       onboarded?: boolean;
     };
+    */
+
+    const s = mustGetSession(req);
+    const email = s.email;
+    const did = s.did;
+    const { name, orgName, orgType, onboarded } = req.body;
 
     if (!email) {
       return res

@@ -2,10 +2,15 @@
 /* eslint-disable no-console */
 import express, { Request, Response } from "express";
 import Recruiter, { IRecruiter } from "../models/Recruiter";
+import Application from "../models/Application";
 import SharedProof from "../models/Proofs";
 import { zkService } from "../services/zk.service";
+import { requireSession } from "../middleware/requireSession";
+import { mustGetSession, mustGetDid } from "../auth/identity";
 
 const router = express.Router();
+
+router.use(requireSession);
 
 /**
  * Small helper to map Mongoose doc -> API shape (RecruiterApi)
@@ -38,81 +43,83 @@ function toRecruiterApi(doc: IRecruiter) {
 }
 
 /**
- * GET /recruiters/me?did=... or ?email=...
+ * GET /recruiters/me  (session-only)
  * Used by:
  *  - RecruiterAuthCard
  *  - Onboarding page initial fetch
  */
-router.get("/me", async (req: Request, res: Response) => {
+router.get("/me", async (req, res) => {
   try {
-    const { did, email } = req.query as { did?: string; email?: string };
+    const s = mustGetSession(req);
+    const did = s.did?.trim();
+    const email = s.email?.trim().toLowerCase();
 
-    if (!did && !email) {
-      return res.status(400).json({ error: "did or email query param required" });
+    if (req.query?.did || req.query?.email) {
+      return res.status(400).json({ error: "Do not send did/email in query. Session-only." });
     }
 
-    let recruiter: IRecruiter | null = null;
+    let recruiter = null;
+    if (did) recruiter = await Recruiter.findOne({ did });
+    if (!recruiter && email) recruiter = await Recruiter.findOne({ contactEmail: email });
 
-    if (did) {
-      recruiter = await Recruiter.findOne({ did });
-    }
-
-    if (!recruiter && email) {
-      recruiter = await Recruiter.findOne({ contactEmail: email });
-    }
-
-    if (!recruiter) {
-      // IMPORTANT: 404 so jfetch throws a "404 ..." error string
-      return res.status(404).json({ error: "Recruiter not found" });
-    }
-
+    if (!recruiter) return res.status(404).json({ error: "Recruiter not found" });
     return res.json(toRecruiterApi(recruiter));
-  } catch (err) {
-    console.error("GET /recruiters/me error:", err);
-    return res.status(500).json({ error: "Failed to fetch recruiter" });
+  } catch (e) {
+    return res.status(401).json({ error: "Unauthenticated" });
   }
 });
 
 // Update recruiter basic profile (org info) without touching KYC/docs.
-router.patch("/me", async (req: Request, res: Response) => {
+router.patch("/me", async (req, res) => {
   try {
-    const { did, orgLegalName, contactEmail, website } = req.body as {
-      did?: string;
-      orgLegalName?: string;
-      contactEmail?: string;
-      website?: string | null;
-    };
+    const s = mustGetSession(req);
+    if (!s.did) return res.status(401).json({ error: "Missing DID in session" });
 
-    if (!did) {
-      return res.status(400).json({ error: "did is required" });
-    }
+    const recruiter = await Recruiter.findOne({ did: s.did });
+    if (!recruiter) return res.status(404).json({ error: "Recruiter not found" });
 
-    const recruiter = await Recruiter.findOne({ did });
+    const { orgLegalName, contactEmail, website } = req.body || {};
 
-    if (!recruiter) {
-      return res.status(404).json({ error: "Recruiter not found" });
-    }
+    if (typeof orgLegalName === "string") recruiter.orgLegalName = orgLegalName;
+    if (typeof contactEmail === "string") recruiter.contactEmail = contactEmail;
 
-    if (typeof orgLegalName === "string") {
-      recruiter.orgLegalName = orgLegalName;
-    }
-    if (typeof contactEmail === "string") {
-      recruiter.contactEmail = contactEmail;
-    }
-
-    // allow empty string / null to clear website
-    if (typeof website === "string") {
-      recruiter.website = website;
-    } else if (website === null) {
-      recruiter.website = undefined; // clear it instead of storing null
-    }
+    if (typeof website === "string") recruiter.website = website;
+    else if (website === null) recruiter.website = undefined;
 
     await recruiter.save();
     return res.json(toRecruiterApi(recruiter));
-  } catch (err) {
-    console.error("PATCH /recruiters/me error:", err);
-    return res.status(500).json({ error: "Failed to update recruiter profile" });
+  } catch (e) {
+    return res.status(401).json({ error: "Unauthenticated" });
   }
+});
+
+// GET /recruiters/public/:id
+router.get("/public/:id", async (req, res) => {
+  const id = String(req.params.id || "").trim();
+
+  // decide whether :id is MongoId or DID
+  const isMongoId = /^[a-f0-9]{24}$/i.test(id);
+
+  const recruiter = isMongoId
+    ? await Recruiter.findById(id)
+    : await Recruiter.findOne({ did: id });
+
+  if (!recruiter) return res.status(404).json({ error: "Recruiter not found" });
+
+  return res.json({
+    id: recruiter._id.toString(),
+    did: recruiter.did,
+    kycStatus: recruiter.kycStatus ?? "none",
+    badge: {
+      verified: recruiter.badge?.verified ?? false,
+      txHash: recruiter.badge?.txHash ?? null,
+      credentialId: recruiter.badge?.credentialId ?? null,
+      network: recruiter.badge?.network ?? null,
+      lastCheckedAt: recruiter.badge?.lastCheckedAt
+        ? recruiter.badge.lastCheckedAt.toISOString()
+        : undefined,
+    },
+  });
 });
 
 /**
@@ -120,33 +127,26 @@ router.patch("/me", async (req: Request, res: Response) => {
  * Body: { did: string; email?: string }
  * Used by onboarding page when recruiter doc doesn't exist yet.
  */
-router.post("/", async (req: Request, res: Response) => {
+router.post("/", async (req, res) => {
   try {
-    const { did, email } = req.body as { did?: string; email?: string };
+    const s = mustGetSession(req);
+    if (!s.did) return res.status(401).json({ error: "Missing DID in session" });
 
-    if (!did) {
-      return res.status(400).json({ error: "did is required" });
-    }
-
-    let recruiter = await Recruiter.findOne({ did });
-    if (recruiter) {
-      return res.json(toRecruiterApi(recruiter));
-    }
+    let recruiter = await Recruiter.findOne({ did: s.did });
+    if (recruiter) return res.json(toRecruiterApi(recruiter));
 
     recruiter = new Recruiter({
-      did,
-      contactEmail: email,
+      did: s.did,
+      contactEmail: s.email, // if present
       onboarded: false,
       kycStatus: "none",
       badge: { verified: false },
     });
 
     await recruiter.save();
-
     return res.status(201).json(toRecruiterApi(recruiter));
-  } catch (err) {
-    console.error("POST /recruiters error:", err);
-    return res.status(500).json({ error: "Failed to create recruiter" });
+  } catch (e) {
+    return res.status(401).json({ error: "Unauthenticated" });
   }
 });
 
@@ -163,45 +163,22 @@ router.post("/", async (req: Request, res: Response) => {
  * Called by onboarding page Step 3 "Submit for Verification".
  * Sets kycStatus="pending" and onboarded=true.
  */
-router.post("/onboarding", async (req: Request, res: Response) => {
+router.post("/onboarding", async (req, res) => {
   try {
-    const {
-      did,
-      orgLegalName,
-      website,
-      contactEmail,
-      kycDocs,
-    }: {
-      did?: string;
-      orgLegalName?: string;
-      website?: string;
-      contactEmail?: string;
-      kycDocs?: {
-        bizRegFilename?: string | null;
-        letterheadFilename?: string | null;
-        hrIdFilename?: string | null;
-      };
-    } = req.body;
+    const s = mustGetSession(req);
+    if (!s.did) return res.status(401).json({ error: "Missing DID in session" });
 
-    if (!did) {
-      return res.status(400).json({ error: "did is required" });
-    }
-
+    const { orgLegalName, website, contactEmail, kycDocs } = req.body || {};
     if (!orgLegalName || !contactEmail) {
-      return res.status(400).json({
-        error: "orgLegalName and contactEmail are required for onboarding",
-      });
+      return res.status(400).json({ error: "orgLegalName and contactEmail are required" });
     }
 
-    const recruiter = await Recruiter.findOne({ did });
-    if (!recruiter) {
-      return res.status(404).json({ error: "Recruiter not found" });
-    }
+    const recruiter = await Recruiter.findOne({ did: s.did });
+    if (!recruiter) return res.status(404).json({ error: "Recruiter not found" });
 
     recruiter.orgLegalName = orgLegalName;
     recruiter.website = website;
     recruiter.contactEmail = contactEmail;
-
     recruiter.kycStatus = "pending";
     recruiter.onboarded = true;
 
@@ -212,43 +189,29 @@ router.post("/onboarding", async (req: Request, res: Response) => {
     };
 
     await recruiter.save();
-
     return res.json(toRecruiterApi(recruiter));
-  } catch (err) {
-    console.error("POST /recruiters/onboarding error:", err);
-    return res.status(500).json({ error: "Failed to submit recruiter onboarding" });
+  } catch (e) {
+    return res.status(401).json({ error: "Unauthenticated" });
   }
 });
 
 router.post("/verify-vc", async (req, res) => {
   try {
+    const recruiterDid = mustGetDid(req);
+
     const { applicationId, vcId } = req.body as { applicationId?: string; vcId?: string };
     if (!applicationId || !vcId) return res.status(400).json({ error: "applicationId and vcId required" });
+
+    const app = await Application.findById(applicationId).lean();
+    if (!app) return res.status(404).json({ error: "Application not found" });
+    if (String((app as any).recruiterDid) !== recruiterDid) return res.status(403).json({ error: "Forbidden" });
 
     const record = await SharedProof.findOne({ applicationId, vcId }).lean();
     if (!record?.revealedDocument) return res.status(404).json({ error: "Shared VC not found" });
 
-    const vc: any = record.revealedDocument;
-    const proof0 = Array.isArray(vc?.proof) ? vc?.proof?.[0] : vc?.proof;
-    console.log("[POST /recruiters/verify-vc] verifying shared VC:", {
-      applicationId,
-      vcId,
-      storedHasDerivedProof: !!(record as any)?.derivedProof,
-      storedHasRevealedDocument: !!(record as any)?.revealedDocument,
-      revealedVcId: vc?.id,
-      revealedType: vc?.type,
-      revealedIssuer: vc?.issuer,
-      revealedHasCredentialSubject: !!vc?.credentialSubject,
-      revealedProofType: proof0?.type,
-      revealedVmId: vc?.verificationMethod?.id,
-      revealedVmType: vc?.verificationMethod?.type,
-    });
-
     const out = await zkService.verifyVc({ vc: record.revealedDocument });
-    console.log("[POST /recruiters/verify-vc] verify result:", out);
     return res.json(out);
   } catch (e: any) {
-    console.error("[POST /recruiters/verify-vc] error:", e?.message ?? String(e));
     return res.status(500).json({ error: "Failed to verify shared VC", details: e?.message ?? String(e) });
   }
 });

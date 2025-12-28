@@ -5,13 +5,120 @@ import Issuer from "../models/Issuer";
 import mongoose from "mongoose";
 import Credential from "../models/Credential";
 import { registerDidOnChain } from "../services/did-registry.service";
+import { requireSession, getSession } from "../middleware/requireSession";
 import crypto from "crypto";
 
 const router = Router();
 
+/**
+ * All seeker routes require an authenticated session.
+ * Identity (did/email) is taken from the verified session, NOT client body/query.
+ */
+router.use(requireSession);
+
 // Simple normaliser: lowercase + trim
 const norm = (s?: string | null) =>
   (s || "").trim().toLowerCase();
+
+type SessionPayload = {
+  did?: string;
+  email?: string;
+  wallet_address?: string;
+};
+
+/**
+ * Prefer DID, fallback email. Throw if neither exists.
+ */
+function mustGetIdentity(req: Request): { did?: string; email?: string; wallet_address?: string } {
+  const s = (getSession(req) || {}) as SessionPayload;
+
+  const did = s.did?.trim();
+  const email = s.email?.trim().toLowerCase();
+  const wallet_address = s.wallet_address?.trim();
+
+  if (!did && !email) {
+    // Should not happen if requireSession is correct, but keep it defensive.
+    throw new Error("Missing session identity (did/email)");
+  }
+  return { did, email, wallet_address };
+}
+
+/**
+ * Optional: validate a client-proposed DID (e.g. did:pkh...) against session wallet.
+ * This lets you keep your current frontend flow (client builds did:pkh) while NOT trusting it blindly.
+ *
+ * If you want to be stricter: remove clientDid entirely and always derive from session.
+ */
+function validateDidAgainstSessionWallet(clientDid: string, session: { wallet_address?: string; did?: string }) {
+  const did = String(clientDid || "").trim();
+  if (!did) return false;
+
+  // If session already is a did:pkh, require exact match
+  if (session.did && session.did.startsWith("did:pkh:")) {
+    return session.did.toLowerCase() === did.toLowerCase();
+  }
+
+  // If session has wallet address, ensure did contains that address
+  if (session.wallet_address) {
+    const addr = session.wallet_address.toLowerCase();
+    const didAddr = (did.match(/0x[a-fA-F0-9]{40}/) || [])[0]?.toLowerCase();
+    return !!didAddr && didAddr === addr;
+  }
+
+  // Fallback: allow if it matches session.did (e.g. did:privy:xxx)
+  if (session.did) {
+    return session.did.toLowerCase() === did.toLowerCase();
+  }
+
+  return false;
+}
+
+/**
+ * Decide which DID we should store on the seeker record.
+ * Preference:
+ *  1) if session.did is did:pkh -> use it
+ *  2) else if session.wallet_address exists -> construct did:pkh:eip155:80002:<addr>
+ *  3) else -> use session.did (e.g. did:privy:...)
+ */
+function deriveDidFromSession(session: SessionPayload): string | undefined {
+  const sDid = session.did?.trim();
+  const w = session.wallet_address?.trim();
+
+  if (sDid && sDid.startsWith("did:pkh:")) return sDid;
+  if (w && /^0x[a-fA-F0-9]{40}$/.test(w)) {
+    return `did:pkh:eip155:80002:${w.toLowerCase()}`;
+  }
+  if (sDid) return sDid;
+  return undefined;
+}
+
+/**
+ * Resolve current seeker doc based on session identity
+ */
+async function findSeekerBySession(req: Request) {
+  const s = mustGetIdentity(req);
+
+  // 1) direct did match
+  if (s.did) {
+    const byDid = await Seeker.findOne({ did: s.did });
+    if (byDid) return byDid;
+  }
+
+  // 2) if session has wallet, try did:pkh derived
+  if (s.wallet_address && /^0x[a-fA-F0-9]{40}$/.test(s.wallet_address)) {
+    const didPkh = `did:pkh:eip155:80002:${s.wallet_address.toLowerCase()}`;
+    const byDerived = await Seeker.findOne({ did: didPkh });
+    if (byDerived) return byDerived;
+  }
+
+  // 3) email fallback
+  if (s.email) {
+    const byEmail = await Seeker.findOne({ email: s.email });
+    if (byEmail) return byEmail;
+  }
+
+  return null;
+}
 
 /**
  * Try to resolve an issuerDid from an organisation name & issuer type.
@@ -89,13 +196,6 @@ function toSeekerDTO(doc: ISeeker | any) {
 
 /**
  * @openapi
- * tags:
- *   - name: Seekers
- *     description: Job seeker identity, DID, and profile
- */
-
-/**
- * @openapi
  * /seekers/onboard:
  *   post:
  *     summary: Create or update a seeker once onboarding completes
@@ -136,10 +236,10 @@ function toSeekerDTO(doc: ISeeker | any) {
  */
 router.post("/onboard", async (req, res) => {
   try {
+    const session = mustGetIdentity(req);
+
     const {
-      email,
       name,
-      did,
       homeLocation,
       classification,
       subClass,
@@ -149,71 +249,71 @@ router.post("/onboard", async (req, res) => {
       antiPhishAck,
       careerSeed,
       onboarded,
-    } = req.body;
+      // optional legacy fields (ignored for identity)
+      //did: clientDid,
+    } = req.body || {};
 
-    if (!email || !name) {
-      return res.status(400).json({ error: "email and name are required" });
+    // Name is still required for onboarding updates
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "name is required" });
     }
 
-    // STEP 1 — Find seeker by DID (preferred) or email
-    let doc: ISeeker | null = null;
+    // Find by session
+    let doc = await findSeekerBySession(req);
 
-    const criteria: any[] = [];
-    if (did) criteria.push({ did });
-    if (email) criteria.push({ email });
-
-    if (criteria.length === 0) {
-      return res.status(400).json({ error: "email or did required" });
-    }
-
-    if (criteria.length === 1) {
-      doc = await Seeker.findOne(criteria[0]);
-    } else {
-      doc = await Seeker.findOne({ $or: criteria });
-    }
-
-    // STEP 2 — If seeker does not exist → create one
+    // Create if not exists
     if (!doc) {
       doc = new Seeker({
-        email,
-        name,
-        // allow caller to decide onboarding state, default false
+        email: session.email, // from session
+        name: String(name).trim(),
         onboarded: !!onboarded,
       });
     }
 
-    // STEP 3 — Only assign DID if:
-    // - DID provided AND
-    // - seeker does NOT already have a DID
-    if (did && !doc.did) {
-      doc.did = did;
+    // Ensure email is set from session (authoritative)
+    if (session.email && !doc.email) doc.email = session.email;
 
-      // Register DID on blockchain for decentralization
+    // Decide DID to store:
+    // - If client provides a did, we ONLY accept it if it matches session wallet/session did
+    // - Otherwise we derive from session
+    const derived = deriveDidFromSession(session);
+    let didToStore: string | undefined = derived;
+
+    /*
+    if (clientDid && validateDidAgainstSessionWallet(String(clientDid), session)) {
+      didToStore = String(clientDid).trim();
+    }
+      */
+
+    // Assign DID only if empty
+    if (didToStore && !doc.did) {
+      doc.did = didToStore;
+
+      // Optional: register DID on-chain (best-effort)
       try {
-        // Extract wallet address from did:pkh format (e.g., did:pkh:eip155:80002:0x...)
-        const addressMatch = did.match(/0x[a-fA-F0-9]{40}/);
+        const addressMatch = didToStore.match(/0x[a-fA-F0-9]{40}/);
         if (addressMatch && process.env.DID_REGISTRY_ADDRESS) {
           const walletAddress = addressMatch[0];
-          // Create a hash of the DID document for on-chain storage
-          const didDocHash = crypto.createHash('sha256').update(did).digest('hex');
-          const txHash = await registerDidOnChain(walletAddress, did, `0x${didDocHash}`);
-          console.log(`[seekers/onboard] DID registered on blockchain: ${did}, tx: ${txHash}`);
-          // Store transaction hash for verification
+          const didDocHash = crypto.createHash("sha256").update(didToStore).digest("hex");
+          const txHash = await registerDidOnChain(walletAddress, didToStore, `0x${didDocHash}`);
+          console.log(`[seekers/onboard] DID registered on blockchain: ${didToStore}, tx: ${txHash}`);
           (doc as any).didRegistrationTxHash = txHash;
         }
       } catch (blockchainErr: any) {
-        // Log but don't fail onboarding if blockchain registration fails
-        console.error("[seekers/onboard] Failed to register DID on blockchain:", blockchainErr.message);
+        console.error(
+          "[seekers/onboard] Failed to register DID on blockchain:",
+          blockchainErr?.message || blockchainErr
+        );
       }
     }
 
-    // STEP 4 — Update other non-unique fields
-    doc.name = name;
+    // Update profile fields (non-identity)
+    doc.name = String(name).trim();
 
-    // "once true, always true" – a false from client won't downgrade it
     if (typeof onboarded === "boolean") {
       doc.onboarded = doc.onboarded || onboarded;
     }
+
     doc.homeLocation = homeLocation;
     doc.classification = classification;
     doc.subClass = subClass;
@@ -222,7 +322,6 @@ router.post("/onboard", async (req, res) => {
     doc.consentShareVC = consentShareVC;
     doc.antiPhishAck = antiPhishAck;
 
-    // STEP 5 — If new career seed provided
     if (careerSeed?.title || careerSeed?.company) {
       doc.profile = { careerHistory: [careerSeed] };
     }
@@ -232,11 +331,15 @@ router.post("/onboard", async (req, res) => {
   } catch (err: any) {
     console.error("POST /seekers/onboard error:", err);
 
-    // Handle duplicate DID cleanly
-    if (err.code === 11000 && err.keyPattern?.did) {
+    if (err?.code === 11000 && err?.keyPattern?.did) {
       return res.status(409).json({
         error: "DID already exists. Please regenerate a new DID.",
       });
+    }
+
+    // If our identity helper threw:
+    if (String(err?.message || "").includes("Missing session identity")) {
+      return res.status(401).json({ error: "Unauthenticated" });
     }
 
     return res.status(500).json({ error: "Failed to onboard seeker" });
@@ -267,13 +370,9 @@ router.post("/onboard", async (req, res) => {
  */
 router.patch("/profile", async (req, res) => {
   try {
-    const { did, email, profile } = req.body;
-    if (!did && !email)
-      return res.status(400).json({ error: "did or email required" });
+    const { profile } = req.body || {};
 
-    const criteria = did ? { did } : { email };
-
-    const doc = await Seeker.findOne(criteria);
+    const doc = await findSeekerBySession(req);
     if (!doc) return res.status(404).json({ error: "Seeker not found" });
 
     doc.profile = {
@@ -328,16 +427,7 @@ router.patch("/profile", async (req, res) => {
  */
 router.post("/profile/section", async (req, res) => {
   try {
-    const {
-      did,
-      email,
-      section,
-      mode,
-      value,
-      requestVc,
-    } = req.body as {
-      did?: string;
-      email?: string;
+    const { section, mode, value, requestVc } = req.body as {
       section: "career" | "education" | "certs";
       mode?: "add" | "edit";
       value: any;
@@ -348,52 +438,30 @@ router.post("/profile/section", async (req, res) => {
       return res.status(400).json({ error: "section and value are required" });
     }
 
-    if (!did && !email) {
-      return res.status(400).json({ error: "did or email is required" });
-    }
-
-    const seeker = await Seeker.findOne(
-      did ? { did } : { email: String(email).toLowerCase() }
-    );
-
-    if (!seeker) {
-      return res.status(404).json({ error: "Seeker not found" });
-    }
+    const seeker = await findSeekerBySession(req);
+    if (!seeker) return res.status(404).json({ error: "Seeker not found" });
 
     // --- 1) Update profile array for the section ---
     const profile = seeker.profile || {};
 
     if (section === "career") {
-      const arr = Array.isArray(profile.careerHistory)
-        ? profile.careerHistory
-        : [];
-      if (mode === "edit" && typeof value._index === "number") {
-        arr[value._index] = value;
-      } else {
-        arr.push(value);
-      }
+      const arr = Array.isArray(profile.careerHistory) ? profile.careerHistory : [];
+      if (mode === "edit" && typeof value._index === "number") arr[value._index] = value;
+      else arr.push(value);
       profile.careerHistory = arr;
     }
 
     if (section === "education") {
       const arr = Array.isArray(profile.education) ? profile.education : [];
-      if (mode === "edit" && typeof value._index === "number") {
-        arr[value._index] = value;
-      } else {
-        arr.push(value);
-      }
+      if (mode === "edit" && typeof value._index === "number") arr[value._index] = value;
+      else arr.push(value);
       profile.education = arr;
     }
 
     if (section === "certs") {
-      const arr = Array.isArray(profile.certifications)
-        ? profile.certifications
-        : [];
-      if (mode === "edit" && typeof value._index === "number") {
-        arr[value._index] = value;
-      } else {
-        arr.push(value);
-      }
+      const arr = Array.isArray(profile.certifications) ? profile.certifications : [];
+      if (mode === "edit" && typeof value._index === "number") arr[value._index] = value;
+      else arr.push(value);
       profile.certifications = arr;
     }
 
@@ -405,23 +473,15 @@ router.post("/profile/section", async (req, res) => {
     if (requestVc) {
       let orgName: string | undefined;
 
-      if (section === "career") {
-        orgName = value.company;
-      } else if (section === "education") {
-        orgName = value.institution;
-      } else if (section === "certs") {
-        orgName = value.organisation || value.issuingOrg || value.name;
-      }
+      if (section === "career") orgName = value.company;
+      else if (section === "education") orgName = value.institution;
+      else if (section === "certs") orgName = value.organisation || value.issuingOrg || value.name;
 
       const issuerDid = orgName
         ? await resolveIssuerDidFromOrg(orgName, section === "certs" ? "certification" : section)
         : null;
 
       if (!issuerDid) {
-        // You may still want to let seeker save the record,
-        // but inform them that VC cannot be requested yet
-        // (no matching issuer)
-        // Here we'll just skip creating a request.
         console.warn("No issuer found for org:", orgName);
       } else {
         const requestId = new mongoose.Types.ObjectId().toString();
@@ -433,14 +493,11 @@ router.post("/profile/section", async (req, res) => {
               ? `${value.qualification || "Study"} at ${orgName}`
               : `${value.name || "Certification"} (${orgName})`;
 
-        const pendingList = Array.isArray(seeker.pendingVcRequests)
-          ? seeker.pendingVcRequests
-          : [];
+        const pendingList = Array.isArray(seeker.pendingVcRequests) ? seeker.pendingVcRequests : [];
 
         const requestEntry = {
           id: requestId,
-          section:
-            section === "certs" ? "certification" : section, // normalise to match issuer routes
+          section: section === "certs" ? "certification" : section,
           title,
           issuerDid,
           status: "pending",
@@ -499,16 +556,12 @@ router.post("/profile/section", async (req, res) => {
  */
 router.patch("/profile/section/:section", async (req, res) => {
   try {
-    const { did, email, value } = req.body;
+    const { value } = req.body || {};
     const section = req.params.section;
 
-    if (!did && !email)
-      return res.status(400).json({ error: "did or email required" });
     if (!value) return res.status(400).json({ error: "value required" });
 
-    const criteria = did ? { did } : { email };
-
-    const doc = await Seeker.findOne(criteria);
+    const doc = await findSeekerBySession(req);
     if (!doc) return res.status(404).json({ error: "Seeker not found" });
 
     const profile = doc.profile ?? {};
@@ -551,10 +604,11 @@ router.patch("/profile/section/:section", async (req, res) => {
         profile.resumeInfo = value.resumeInfo ?? "";
         break;
 
-      case "visibility":
+      case "visibility": {
         profile.visibility = value.visibility;
         doc.visibility = value.visibility;
         break;
+      }
 
       default:
         return res.status(400).json({ error: `Unknown section: ${section}` });
@@ -566,7 +620,7 @@ router.patch("/profile/section/:section", async (req, res) => {
     return res.json(toSeekerDTO(doc));
   } catch (err) {
     console.error("PATCH /seekers/profile/section error:", err);
-    return res.status(500).json({ error: "Failed to update profile section" });
+    return res.status(500).json({ error: "Failed to update profile" });
   }
 });
 
@@ -599,18 +653,17 @@ router.patch("/profile/section/:section", async (req, res) => {
  */
 router.post("/vcs/request", async (req, res) => {
   try {
-    const { did, email, section, title, issuerDid } = req.body;
+    const { section, title, issuerDid } = req.body as {
+      section: "career" | "education" | "certification";
+      title: string;
+      issuerDid: string;
+    };
 
-    if (!did && !email)
-      return res.status(400).json({ error: "did or email required" });
-    if (!section || !title || !issuerDid)
-      return res.status(400).json({
-        error: "section, title, issuerDid required",
-      });
+    if (!section || !title || !issuerDid) {
+      return res.status(400).json({ error: "section, title, issuerDid required" });
+    }
 
-    const criteria = did ? { did } : { email };
-
-    const doc = await Seeker.findOne(criteria);
+    const doc = await findSeekerBySession(req);
     if (!doc) return res.status(404).json({ error: "Seeker not found" });
 
     const newReq = {
@@ -632,18 +685,10 @@ router.post("/vcs/request", async (req, res) => {
   }
 });
 
-// GET /seekers/vcs/share-default?did=... or ?email=...
+// GET /seekers/vcs/share-default  (session-only)
 router.get("/vcs/share-default", async (req, res) => {
   try {
-    let { did, email } = req.query as { did?: string; email?: string };
-
-    if (!did && !email) return res.status(400).json({ error: "did or email required" });
-
-    const filter: any = {};
-    if (did) filter.did = String(did).trim();
-    if (email) filter.email = String(email).trim().toLowerCase();
-
-    const doc = await Seeker.findOne(filter).lean();
+    const doc = await findSeekerBySession(req);
     if (!doc) return res.status(404).json({ error: "Seeker not found" });
 
     return res.json({ defaultSharedVcIds: (doc as any).defaultSharedVcIds ?? [] });
@@ -657,19 +702,15 @@ router.get("/vcs/share-default", async (req, res) => {
 // body: { did?: string, email?: string, defaultSharedVcIds: string[] }
 router.patch("/vcs/share-default", async (req, res) => {
   try {
-    const { did, email, defaultSharedVcIds } = req.body as {
-      did?: string;
-      email?: string;
+    const { defaultSharedVcIds } = req.body as {
       defaultSharedVcIds?: string[];
     };
 
-    if (!did && !email) return res.status(400).json({ error: "did or email required" });
-    if (!Array.isArray(defaultSharedVcIds))
+    if (!Array.isArray(defaultSharedVcIds)) {
       return res.status(400).json({ error: "defaultSharedVcIds must be an array" });
+    }
 
-    const criteria = did ? { did } : { email: String(email).toLowerCase() };
-
-    const doc = await Seeker.findOne(criteria);
+    const doc = await findSeekerBySession(req);
     if (!doc) return res.status(404).json({ error: "Seeker not found" });
 
     // Collect allowed credentialIds from issued VCs only
@@ -697,7 +738,7 @@ router.patch("/vcs/share-default", async (req, res) => {
  * @openapi
  * /seekers/me:
  *   get:
- *     summary: Get seeker by DID or email
+ *     summary: Get seeker (session-only)
  *     tags: [Seekers]
  *     parameters:
  *       - in: query
@@ -714,25 +755,8 @@ router.patch("/vcs/share-default", async (req, res) => {
  */
 router.get("/me", async (req: Request, res: Response) => {
   try {
-    let { did, email } = req.query as {
-      did?: string | string[];
-      email?: string | string[];
-    };
-
-    if (Array.isArray(did)) did = did[0];
-    if (Array.isArray(email)) email = email[0];
-
-    const filter: any = {};
-    if (did && did.trim()) filter.did = did.trim();
-    if (email && email.trim()) filter.email = email.trim().toLowerCase();
-
-    if (!filter.did && !filter.email) {
-      return res.status(400).json({ error: "did or email required" });
-    }
-
-    const doc = await Seeker.findOne(filter).lean();
+    const doc = await findSeekerBySession(req);
     if (!doc) return res.status(404).json({ error: "Seeker not found" });
-
     return res.json(toSeekerDTO(doc));
   } catch (err) {
     console.error("GET /seekers/me error:", err);
@@ -750,18 +774,21 @@ router.get("/vcs/:credentialId", async (req, res) => {
       return res.status(400).json({ error: "credentialId is required" });
     }
 
-    const cred = await Credential.findOne({ credentialId }).lean();
+    const seeker = await findSeekerBySession(req);
+    if (!seeker) return res.status(404).json({ error: "Seeker not found" });
 
-    if (!cred) {
-      return res.status(404).json({ error: "Credential not found" });
+    // Ownership check: credentialId must be in seeker's issued VCs list
+    const issued = Array.isArray((seeker as any).vcs) ? (seeker as any).vcs : [];
+    const owns = issued.some((v: any) => String(v.credentialId || v.id || "") === String(credentialId));
+    if (!owns) {
+      return res.status(403).json({ error: "Forbidden: VC does not belong to this seeker" });
     }
+
+    const cred = await Credential.findOne({ credentialId }).lean();
+    if (!cred) return res.status(404).json({ error: "Credential not found" });
 
     const raw: any = (cred as any).vcRaw;
-    if (!raw) {
-      return res
-        .status(404)
-        .json({ error: "vcRaw not found for this credential" });
-    }
+    if (!raw) return res.status(404).json({ error: "vcRaw not found for this credential" });
 
     // Normalise to object
     let vc: any = raw;
@@ -773,13 +800,10 @@ router.get("/vcs/:credentialId", async (req, res) => {
       }
     }
 
-    // 🔹 Shape expected by the frontend: { vcRaw: <full VC JSON> }
-    return res.json({ vcRaw: vc, credentialId: cred.credentialId });
+    return res.json({ vcRaw: vc, credentialId: (cred as any).credentialId });
   } catch (err) {
     console.error("GET /seekers/vcs/:credentialId error:", err);
-    return res
-      .status(500)
-      .json({ error: "Failed to load stored VC for this credential" });
+    return res.status(500).json({ error: "Failed to load stored VC for this credential" });
   }
 });
 

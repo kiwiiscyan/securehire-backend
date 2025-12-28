@@ -1,7 +1,9 @@
 // src/server.ts
 import "dotenv/config";
-import express, { Express } from "express";
+import express, { Express, Request, NextFunction, Response } from "express";
 import cors from "cors";
+import crypto from "crypto";
+import { limitApiBaseline } from "./middleware/rateLimitBaseline";
 import { requireInternalKey } from "./middleware/requireInternalKey";
 import mongoose, { connectMongo } from "./config/mongo";
 import swaggerUi from "swagger-ui-express";
@@ -11,6 +13,26 @@ import recruiterRoutes from "./routes/recruiters";
 import proofsRouter from "./routes/proofs";
 import trustRouter from "./routes/trust";
 import applicationsRouter from "./routes/applications";
+import authRouter from "./routes/auth";
+
+import helmet from "helmet";
+
+function requestIdMiddleware(req: Request, res: Response, next: NextFunction) {
+  // Accept upstream ID if provided (useful if you put nginx/Cloudflare later)
+  const incoming =
+    (req.headers["x-request-id"] as string | undefined) ||
+    (req.headers["x-correlation-id"] as string | undefined);
+
+  const id = incoming?.trim() || crypto.randomUUID();
+
+  // Attach to request for logging
+  (req as any).id = id;
+
+  // Add response header so frontend can report it
+  res.setHeader("x-request-id", id);
+
+  next();
+}
 
 export function createApp(routers: {
   jobsRouter: express.Router;
@@ -18,6 +40,18 @@ export function createApp(routers: {
 }): Express {
   const app = express();
 
+  // 0) Proxy awareness (needed for correct req.ip behind Vercel/NGINX/etc.)
+  if (process.env.TRUST_PROXY === "true") {
+    app.set("trust proxy", 1);
+  }
+
+  // 1) Request correlation id early
+  app.use(requestIdMiddleware);
+
+  // 2) Security headers early
+  app.use(helmet());
+
+  // 3) CORS early
   app.use(
     cors({
       origin: process.env.CORS_ORIGIN,
@@ -28,7 +62,12 @@ export function createApp(routers: {
 
   app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
+  // Apply baseline throttling FIRST (reduces load even for bad internal-key requests)
+  app.use("/api/v1", limitApiBaseline());
+
   app.use("/api/v1", requireInternalKey);
+
+  app.use("/api/v1/auth", authRouter);
 
   app.use("/api/v1/jobs", routers.jobsRouter);
   app.use("/api/v1/seekers", routers.seekersRouter);

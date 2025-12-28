@@ -3,8 +3,16 @@ import { Router, type Request, type Response } from "express";
 import Job, { IJob } from "../models/Jobs";
 import Recruiter, { IRecruiter } from "../models/Recruiter";
 import { getRecruiterTrustStatusFromChain } from "../services/chain.service";
+import { requireSession, getSession } from "../middleware/requireSession";
 
 const router = Router();
+
+function mustGetRecruiterDid(req: Request): string {
+  const s = getSession(req);
+  const did = String(s?.did || "").trim();
+  if (!did) throw new Error("Unauthenticated");
+  return did;
+}
 
 /**
  * Transform Mongo Job document -> frontend Job shape
@@ -142,6 +150,22 @@ async function attachRecruiterMeta(docs: IJob[]): Promise<JobDTO[]> {
     return toJobDTO(doc);
   });
 }
+
+// GET /jobs/mine (session-only)
+router.get("/mine", requireSession, async (req, res) => {
+  try {
+    const didOwner = mustGetRecruiterDid(req);
+
+    // recruiter can see all own jobs (any status)
+    const docs = await Job.find({ didOwner }).sort({ createdAt: -1 });
+    const jobs = await attachRecruiterMeta(docs);
+
+    return res.json(jobs);
+  } catch (err) {
+    console.error("GET /jobs/mine error", err);
+    return res.status(500).json({ error: "Failed to load recruiter jobs" });
+  }
+});
 
 /**
  * @openapi
@@ -427,8 +451,9 @@ router.get("/", async (req, res) => {
  *       201:
  *         description: Job created
  */
-router.post("/", async (req, res) => {
+router.post("/", requireSession, async (req, res) => {
   try {
+    const didOwner = mustGetRecruiterDid(req);
     const {
       title,
       company,
@@ -459,7 +484,6 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const didOwner = req.body.didOwner as string; // for now – later infer from recruiter auth
     if (!didOwner) {
       return res.status(400).json({ error: "didOwner (recruiter DID) required" });
     }
@@ -519,9 +543,8 @@ router.get("/:id", async (req: Request, res: Response) => {
  * Full update of a job document.
  * Used by recruiter Job Management page when editing a job.
  */
-router.put("/:id", async (req: Request, res: Response) => {
+router.put("/:id", requireSession, async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
 
     const {
       title,
@@ -530,7 +553,6 @@ router.put("/:id", async (req: Request, res: Response) => {
       description,
       tags,
       category,
-      didOwner,
       verified,
       trustStatus,
       postedAt,
@@ -556,9 +578,12 @@ router.put("/:id", async (req: Request, res: Response) => {
       });
     }
 
-    const job = await Job.findById(id);
-    if (!job) {
-      return res.status(404).json({ error: "Job not found" });
+    const recruiterDid = mustGetRecruiterDid(req);
+    const job = await Job.findById(req.params.id);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+
+    if (String(job.didOwner || "") !== recruiterDid) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
     job.title = title;
@@ -567,11 +592,6 @@ router.put("/:id", async (req: Request, res: Response) => {
     job.description = description;
     job.tags = tags ?? [];
     job.category = category;
-
-    // In a real system you'd infer didOwner from auth; for now we allow body override.
-    if (typeof didOwner === "string") {
-      job.didOwner = didOwner;
-    }
 
     if (typeof verified === "boolean") {
       job.verified = verified;
@@ -617,14 +637,20 @@ router.put("/:id", async (req: Request, res: Response) => {
  * PATCH /jobs/:id
  * Lightweight partial update (used mainly for closing a job).
  */
-router.patch("/:id", async (req: Request, res: Response) => {
+router.patch("/:id", requireSession, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { status } = req.body as { status?: string };
 
+    const recruiterDid = mustGetRecruiterDid(req);
+
     const job = await Job.findById(id);
     if (!job) {
       return res.status(404).json({ error: "Job not found" });
+    }
+
+    if (String(job.didOwner || "") !== recruiterDid) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
     if (status) {
