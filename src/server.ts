@@ -3,7 +3,7 @@ import "dotenv/config";
 import express, { Express, Request, NextFunction, Response } from "express";
 import cors from "cors";
 import crypto from "crypto";
-import { limitApiBaseline } from "./middleware/rateLimitBaseline";
+//import { limitApiBaseline } from "./middleware/rateLimitBaseline";
 import { requireInternalKey } from "./middleware/requireInternalKey";
 import mongoose, { connectMongo } from "./config/mongo";
 import swaggerUi from "swagger-ui-express";
@@ -63,7 +63,7 @@ export function createApp(routers: {
   app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
   // Apply baseline throttling FIRST (reduces load even for bad internal-key requests)
-  app.use("/api/v1", limitApiBaseline());
+  // app.use("/api/v1", limitApiBaseline());
 
   app.use("/api/v1", requireInternalKey);
 
