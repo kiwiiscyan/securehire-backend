@@ -15,11 +15,21 @@ export interface IRecruiter extends Document {
   };
   badge: {
     verified: boolean;
+
+    // IMPORTANT: match schema and UI semantics
+    status?: "None" | "Active" | "Revoked" | "Rejected" | "Pending";
+
     level?: number;
     lastCheckedAt?: Date;
+
     txHash?: string | null;
     network?: string | null;
     credentialId?: string | null;
+
+    // revocation metadata
+    revokedAt?: Date;
+    revokeReason?: string | null;
+    revocationTxHash?: string | null;
   };
   createdAt?: Date;
   updatedAt?: Date;
@@ -48,11 +58,15 @@ const RecruiterSchema = new Schema<IRecruiter>(
 
     badge: {
       verified: { type: Boolean, default: false },
+      status: { type: String, enum: ["None", "Pending", "Active", "Revoked", "Rejected"], default: "None" },
       level: { type: Number },
       lastCheckedAt: Date,
       txHash: { type: String },
       network: { type: String },
       credentialId: { type: String },
+      revokedAt: Date,
+      revokeReason: { type: String },
+      revocationTxHash: { type: String },
     },
   },
   { timestamps: true }

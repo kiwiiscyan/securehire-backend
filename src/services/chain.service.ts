@@ -98,3 +98,13 @@ export async function readOnChainStatus(
     lastUpdated: new Date().toISOString(),
   };
 }
+
+export async function revokeRecruiterBadgeOnChain(
+  did: string
+): Promise<{ txHash: string; network: string }> {
+  const contract = getTrustBadgeRegistryContract();
+  const tx = await contract.revokeBadge(did);
+  const receipt = await tx.wait();
+
+  return { txHash: receipt.hash, network: "polygon-amoy" };
+}

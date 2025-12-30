@@ -124,6 +124,24 @@ function isOwnerOfApplication(sessionDid: string, app: any) {
   return did === String(app.seekerDid) || did === String(app.recruiterDid);
 }
 
+async function filterActiveSharedProofs(sharedProofs: any[]) {
+  if (!sharedProofs?.length) return [];
+
+  const vcIds = Array.from(new Set(sharedProofs.map((p: any) => String(p.vcId || "")).filter(Boolean)));
+  if (!vcIds.length) return [];
+
+  const activeCreds = await Credential.find({
+    credentialId: { $in: vcIds },
+    status: "active",
+  })
+    .select({ credentialId: 1 })
+    .lean();
+
+  const activeSet = new Set(activeCreds.map((c: any) => String(c.credentialId)));
+
+  return sharedProofs.filter((p: any) => activeSet.has(String(p.vcId)));
+}
+
 /**
  * @openapi
  * /applications:
@@ -405,7 +423,7 @@ router.get("/by-job", async (req, res) => {
     const applicationIds = apps.map((a: any) => a._id.toString());
     const seekerDids = Array.from(new Set(apps.map((a: any) => a.seekerDid)));
 
-    const [seekers, sharedProofs] = await Promise.all([
+    const [seekers, sharedProofsRaw] = await Promise.all([
       seekerDids.length
         ? Seeker.find({ did: { $in: seekerDids } }).lean()
         : [],
@@ -413,6 +431,8 @@ router.get("/by-job", async (req, res) => {
         ? SharedProof.find({ applicationId: { $in: applicationIds } }).lean()
         : [],
     ]);
+
+    const sharedProofs = await filterActiveSharedProofs(sharedProofsRaw);
 
     const seekerByDid = new Map<string, any>();
     seekers.forEach((s: any) => {
@@ -474,9 +494,11 @@ router.get("/:id", async (req, res) => {
     const job = await Job.findById(app.jobId).lean();
     const seeker = await Seeker.findOne({ did: app.seekerDid }).lean();
 
-    const proofs = await SharedProof.find({
+    const proofsRaw = await SharedProof.find({
       applicationId: id.toString(),
     }).lean();
+
+    const safeProofs = await filterActiveSharedProofs(proofsRaw);
 
     const recruiterKyc = (recruiter as any)?.kycStatus;
     const recruiterBadgeVerified = Boolean((recruiter as any)?.badge?.verified);
@@ -531,8 +553,8 @@ router.get("/:id", async (req, res) => {
         : null,
     };
 
-    if (proofs.length > 0) {
-      appWithProofs.proofs = proofs.map((p: any) => ({
+    if (safeProofs.length > 0) {
+      appWithProofs.proofs = safeProofs.map((p: any) => ({
         vcId: p.vcId,
         revealedDocument: p.revealedDocument,
         isVcShared: true

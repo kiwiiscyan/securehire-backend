@@ -12,7 +12,7 @@ export interface IJob extends Document {
   category: string;
   didOwner?: string;
   verified?: boolean;
-  trustStatus?: "Active" | "Suspended" | "Revoked" | "None";
+  trustStatus?: "Active" | "Suspended" | "Revoked" | "Untrustworthy" | "None";
   postedAt?: Date;
   workType?: "full-time" | "part-time" | "contract" | "casual";
   salaryText?: string;
@@ -49,7 +49,7 @@ const JobSchema = new Schema<IJob>(
     verified: { type: Boolean, default: false },
     trustStatus: {
       type: String,
-      enum: ["Active", "Suspended", "Revoked", "None"],
+      enum: ["Active", "Suspended", "Revoked", "Untrustworthy", "None"],
       default: "None",
     },
     postedAt: { type: Date }, // optional; if missing we’ll use createdAt

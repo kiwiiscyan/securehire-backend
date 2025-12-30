@@ -10,8 +10,6 @@ import { mustGetSession, mustGetDid } from "../auth/identity";
 
 const router = express.Router();
 
-router.use(requireSession);
-
 /**
  * Small helper to map Mongoose doc -> API shape (RecruiterApi)
  */
@@ -27,12 +25,18 @@ function toRecruiterApi(doc: IRecruiter) {
     badge: {
       verified: doc.badge?.verified ?? false,
       level: doc.badge?.level,
+      status: (doc.badge as any)?.status ?? "None",
       lastCheckedAt: doc.badge?.lastCheckedAt
         ? doc.badge.lastCheckedAt.toISOString()
         : undefined,
       txHash: doc.badge?.txHash ?? null,
       network: doc.badge?.network ?? null,
       credentialId: doc.badge?.credentialId ?? null,
+      revocationTxHash: (doc.badge as any)?.revocationTxHash ?? null,
+      revokeReason: (doc.badge as any)?.revokeReason ?? null,
+      revokedAt: (doc.badge as any)?.revokedAt
+        ? (doc.badge as any).revokedAt.toISOString()
+        : null,
     },
     kycDocs: {
       bizRegFilename: doc.kycDocs?.bizRegFilename ?? null,
@@ -48,7 +52,7 @@ function toRecruiterApi(doc: IRecruiter) {
  *  - RecruiterAuthCard
  *  - Onboarding page initial fetch
  */
-router.get("/me", async (req, res) => {
+router.get("/me", requireSession, async (req, res) => {
   try {
     const s = mustGetSession(req);
     const did = s.did?.trim();
@@ -70,7 +74,7 @@ router.get("/me", async (req, res) => {
 });
 
 // Update recruiter basic profile (org info) without touching KYC/docs.
-router.patch("/me", async (req, res) => {
+router.patch("/me", requireSession, async (req, res) => {
   try {
     const s = mustGetSession(req);
     if (!s.did) return res.status(401).json({ error: "Missing DID in session" });
@@ -112,9 +116,15 @@ router.get("/public/:id", async (req, res) => {
     kycStatus: recruiter.kycStatus ?? "none",
     badge: {
       verified: recruiter.badge?.verified ?? false,
+      status: (recruiter.badge as any)?.status ?? "None",
       txHash: recruiter.badge?.txHash ?? null,
       credentialId: recruiter.badge?.credentialId ?? null,
       network: recruiter.badge?.network ?? null,
+      revocationTxHash: (recruiter.badge as any)?.revocationTxHash ?? null,
+      revokeReason: (recruiter.badge as any)?.revokeReason ?? null,
+      revokedAt: (recruiter.badge as any)?.revokedAt
+        ? (recruiter.badge as any).revokedAt.toISOString()
+        : null,
       lastCheckedAt: recruiter.badge?.lastCheckedAt
         ? recruiter.badge.lastCheckedAt.toISOString()
         : undefined,
@@ -127,7 +137,7 @@ router.get("/public/:id", async (req, res) => {
  * Body: { did: string; email?: string }
  * Used by onboarding page when recruiter doc doesn't exist yet.
  */
-router.post("/", async (req, res) => {
+router.post("/", requireSession, async (req, res) => {
   try {
     const s = mustGetSession(req);
     if (!s.did) return res.status(401).json({ error: "Missing DID in session" });
@@ -163,7 +173,7 @@ router.post("/", async (req, res) => {
  * Called by onboarding page Step 3 "Submit for Verification".
  * Sets kycStatus="pending" and onboarded=true.
  */
-router.post("/onboarding", async (req, res) => {
+router.post("/onboarding", requireSession, async (req, res) => {
   try {
     const s = mustGetSession(req);
     if (!s.did) return res.status(401).json({ error: "Missing DID in session" });
@@ -181,6 +191,11 @@ router.post("/onboarding", async (req, res) => {
     recruiter.contactEmail = contactEmail;
     recruiter.kycStatus = "pending";
     recruiter.onboarded = true;
+    recruiter.badge = {
+      ...(recruiter.badge || {}),
+      verified: false,
+      status: "Pending",
+    };
 
     recruiter.kycDocs = {
       bizRegFilename: kycDocs?.bizRegFilename ?? null,
@@ -195,7 +210,7 @@ router.post("/onboarding", async (req, res) => {
   }
 });
 
-router.post("/verify-vc", async (req, res) => {
+router.post("/verify-vc", requireSession, async (req, res) => {
   try {
     const recruiterDid = mustGetDid(req);
 

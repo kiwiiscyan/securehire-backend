@@ -4,7 +4,10 @@ import Credential from "../models/Credential";
 import Seeker from "../models/Seeker";
 import Issuer, { IIssuer } from "../models/Issuer";
 import Recruiter, { IRecruiter } from "../models/Recruiter";
-import { issueRecruiterBadgeOnChain } from "../services/chain.service";
+import SharedProof from "../models/Proofs";
+import Application from "../models/Application";
+import mongoose from "mongoose";
+import { issueRecruiterBadgeOnChain, revokeRecruiterBadgeOnChain } from "../services/chain.service";
 import {
   issueSimpleVc,
   CredentialType,
@@ -135,6 +138,11 @@ function toRecruiterApi(doc: IRecruiter) {
         : undefined,
       txHash: doc.badge?.txHash ?? null,
       network: doc.badge?.network ?? null,
+      revocationTxHash: (doc.badge as any)?.revocationTxHash ?? null,
+      revokeReason: (doc.badge as any)?.revokeReason ?? null,
+      revokedAt: (doc.badge as any)?.revokedAt
+        ? (doc.badge as any).revokedAt.toISOString()
+        : null,
     },
     kycDocs: {
       bizRegFilename: doc.kycDocs?.bizRegFilename ?? null,
@@ -335,21 +343,97 @@ router.get("/vc/:credentialId", async (req: Request, res: Response) => {
  *               credentialId: { type: string }
  *               reason: { type: string }
  */
+// POST /issuer/vc/revoke (standalone-safe)
 router.post("/vc/revoke", async (req, res) => {
   const { credentialId, reason } = req.body;
-  if (!credentialId)
-    return res.status(400).json({ error: "credentialId required" });
+  if (!credentialId) return res.status(400).json({ error: "credentialId required" });
 
-  const cred = await Credential.findOneAndUpdate(
-    { credentialId },
-    { status: "revoked" },
-    { new: true }
-  );
+  const issuerDid = mustGetDid(req);
 
-  if (!cred) return res.status(404).json({ error: "not found" });
+  try {
+    const cred = await Credential.findOne({ credentialId, issuerDid }).lean();
+    if (!cred) return res.status(404).json({ error: "not found" });
 
-  // TODO: also update on-chain registry via chain.service
-  res.json({ revoked: true, reason: reason || "unspecified", meta: cred });
+    // 1) Revoke off-chain VC
+    const updated = await Credential.findOneAndUpdate(
+      { credentialId, issuerDid },
+      {
+        $set: {
+          status: "revoked",
+          revokedAt: new Date(),
+          revokeReason: reason || "unspecified",
+        },
+      },
+      { new: true }
+    ).lean();
+
+    // 2) If this is a recruiter trust VC, also revoke on-chain + update Recruiter.badge
+    const isRecruiterVc =
+      Array.isArray(cred.type) && cred.type.includes("RecruiterCredential");
+
+    let badgeRevocation: any = null;
+
+    if (isRecruiterVc) {
+      // find recruiter by DID = subjectDid
+      const recruiter = await Recruiter.findOne({ did: cred.subjectDid });
+
+      if (recruiter) {
+        // revoke on-chain
+        const tx = await revokeRecruiterBadgeOnChain(recruiter.did);
+
+        // update recruiter badge
+        await Recruiter.updateOne(
+          { _id: recruiter._id },
+          {
+            $set: {
+              "badge.verified": false,
+              "badge.status": "Revoked",
+              "badge.lastCheckedAt": new Date(),
+              "badge.revokedAt": new Date(),
+              "badge.revokeReason": reason || "unspecified",
+              "badge.revocationTxHash": tx.txHash,
+              "badge.network": tx.network,
+            },
+          }
+        );
+
+        // optional: also store revocation tx on credential
+        await Credential.updateOne(
+          { credentialId, issuerDid },
+          { $set: { revocationTxHash: tx.txHash } }
+        );
+
+        badgeRevocation = tx;
+      }
+    } else {
+      // Non-recruiter VC cleanup (job seeker flow)
+      await Seeker.updateOne(
+        { did: cred.subjectDid },
+        {
+          $set: { "vcs.$[v].status": "revoked" },
+          $pull: { defaultSharedVcIds: credentialId },
+        },
+        { arrayFilters: [{ "v.credentialId": credentialId }] }
+      );
+
+      await Application.updateMany(
+        { sharedVcIds: credentialId },
+        { $pull: { sharedVcIds: credentialId } }
+      );
+
+      await SharedProof.deleteMany({ vcId: credentialId });
+    }
+
+    return res.json({
+      revoked: true,
+      reason: reason || "unspecified",
+      meta: updated,
+      badgeRevocation, // null for normal VCs
+    });
+  } catch (err) {
+    console.error("POST /issuer/vc/revoke error:", err);
+    return res.status(500).json({ error: "Failed to revoke VC" });
+  }
 });
 
 /**
@@ -780,6 +864,7 @@ router.post("/recruiters/:id/approve", async (req: Request, res: Response) => {
     recruiter.kycStatus = "approved";
     recruiter.badge = {
       verified: true,
+      status: "Active",
       level: 1,
       lastCheckedAt: new Date(),
       txHash: badge.txHash,
@@ -815,7 +900,12 @@ router.post("/recruiters/:id/reject", async (req: Request, res: Response) => {
     }
 
     recruiter.kycStatus = "rejected";
-    recruiter.badge.verified = false;
+    recruiter.badge = {
+      ...(recruiter.badge || {}),
+      verified: false,
+      status: "Rejected",
+      lastCheckedAt: new Date(),
+    };
     await recruiter.save();
 
     return res.json(toRecruiterApi(recruiter));

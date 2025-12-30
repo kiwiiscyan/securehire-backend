@@ -97,6 +97,47 @@ function parseSalaryRange(text?: string): { min?: number; max?: number } {
   return { min, max };
 }
 
+function mapRecruiterBadgeToJobTrustStatus(
+  badgeStatus?: string,
+  badgeVerified?: boolean
+): { trustStatus: "Active" | "Suspended" | "Revoked" | "Untrustworthy" | "None"; verified: boolean } {
+  const s = String(badgeStatus || "").trim().toLowerCase();
+
+  // Your exact mapping requirements:
+  if (s === "active") {
+    return { trustStatus: "Active", verified: true };
+  }
+  if (s === "pending") {
+    return { trustStatus: "Suspended", verified: false };
+  }
+  if (s === "revoked") {
+    return { trustStatus: "Revoked", verified: false };
+  }
+  if (s === "rejected") {
+    return { trustStatus: "Untrustworthy", verified: false };
+  }
+
+  // Fallback: if you still want legacy behavior for verified flag
+  if (badgeVerified) {
+    return { trustStatus: "Active", verified: true };
+  }
+
+  return { trustStatus: "None", verified: false };
+}
+
+async function computeTrustStatusForJob(didOwner: string) {
+  // If you truly want chain to be source-of-truth, you must ALSO map its statuses.
+  // For now, keep it simple: DB as truth.
+  const recruiter = await Recruiter.findOne({ did: didOwner }).lean();
+
+  const badgeStatus = (recruiter as any)?.badge?.status;
+  const badgeVerified = Boolean((recruiter as any)?.badge?.verified);
+
+  const out = mapRecruiterBadgeToJobTrustStatus(badgeStatus, badgeVerified);
+  return out.trustStatus;
+}
+
+/*
 async function computeTrustStatusForJob(didOwner: string) {
   // Option A: use chain directly
   if (process.env.TRUST_BADGE_REGISTRY_ADDR) {
@@ -108,6 +149,7 @@ async function computeTrustStatusForJob(didOwner: string) {
   if (recruiter?.badge?.verified) return "Active";
   return "None";
 }
+*/
 
 async function attachRecruiterMeta(docs: IJob[]): Promise<JobDTO[]> {
   // collect all DIDs from jobs
@@ -128,6 +170,7 @@ async function attachRecruiterMeta(docs: IJob[]): Promise<JobDTO[]> {
   return docs.map((doc) => {
     const rec = doc.didOwner ? recruitersByDid.get(doc.didOwner) : undefined;
 
+    /*
     if (rec) {
       const kyc = rec.kycStatus ?? "none";
       const badgeVerified = rec.badge?.verified ?? false;
@@ -146,6 +189,17 @@ async function attachRecruiterMeta(docs: IJob[]): Promise<JobDTO[]> {
         doc.trustStatus = "None";
       }
     }
+      */
+
+    if (rec) {
+      const badgeStatus = (rec.badge as any)?.status;
+      const badgeVerified = Boolean(rec.badge?.verified);
+    
+      const mapped = mapRecruiterBadgeToJobTrustStatus(badgeStatus, badgeVerified);
+    
+      doc.verified = mapped.verified;
+      doc.trustStatus = mapped.trustStatus;
+    }    
 
     return toJobDTO(doc);
   });
@@ -498,7 +552,7 @@ router.post("/", requireSession, async (req, res) => {
       tags: tags ?? [],
       category,
       didOwner,
-      verified,
+      verified: trustStatus === "Active",
       trustStatus,
       postedAt: postedAt ? new Date(postedAt) : undefined,
       workType,
@@ -531,7 +585,9 @@ router.get("/:id", async (req: Request, res: Response) => {
     if (!job) {
       return res.status(404).json({ error: "Job not found" });
     }
-    return res.json(toJobDTO(job));
+    const [dto] = await attachRecruiterMeta([job]);
+    return res.json(dto);
+    //return res.json(toJobDTO(job));
   } catch (err) {
     console.error("GET /jobs/:id error:", err);
     return res.status(500).json({ error: "Failed to fetch job" });
