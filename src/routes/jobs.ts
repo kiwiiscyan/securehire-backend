@@ -4,6 +4,9 @@ import Job, { IJob } from "../models/Jobs";
 import Recruiter, { IRecruiter } from "../models/Recruiter";
 import { getRecruiterTrustStatusFromChain } from "../services/chain.service";
 import { requireSession, getSession } from "../middleware/requireSession";
+import { requireUser } from "../middleware/requireUser";
+import { syncRecruiterRoleFromRecruiterDoc } from "../middleware/syncRecruiterRoleFromRecruiterDoc";
+import { requireRoleActive, requireRoleStateIn } from "../middleware/rbac";
 
 const router = Router();
 
@@ -194,32 +197,16 @@ async function attachRecruiterMeta(docs: IJob[]): Promise<JobDTO[]> {
     if (rec) {
       const badgeStatus = (rec.badge as any)?.status;
       const badgeVerified = Boolean(rec.badge?.verified);
-    
+
       const mapped = mapRecruiterBadgeToJobTrustStatus(badgeStatus, badgeVerified);
-    
+
       doc.verified = mapped.verified;
       doc.trustStatus = mapped.trustStatus;
-    }    
+    }
 
     return toJobDTO(doc);
   });
 }
-
-// GET /jobs/mine (session-only)
-router.get("/mine", requireSession, async (req, res) => {
-  try {
-    const didOwner = mustGetRecruiterDid(req);
-
-    // recruiter can see all own jobs (any status)
-    const docs = await Job.find({ didOwner }).sort({ createdAt: -1 });
-    const jobs = await attachRecruiterMeta(docs);
-
-    return res.json(jobs);
-  } catch (err) {
-    console.error("GET /jobs/mine error", err);
-    return res.status(500).json({ error: "Failed to load recruiter jobs" });
-  }
-});
 
 /**
  * @openapi
@@ -460,6 +447,46 @@ router.get("/", async (req, res) => {
   }
 });
 
+// GET /jobs/mine (session-only)
+router.get("/mine",
+  requireSession,
+  requireUser,
+  syncRecruiterRoleFromRecruiterDoc,
+  requireRoleStateIn("recruiter", ["pending", "active", "rejected"]),
+  async (req, res) => {
+    try {
+      const didOwner = mustGetRecruiterDid(req);
+
+      // recruiter can see all own jobs (any status)
+      const docs = await Job.find({ didOwner }).sort({ createdAt: -1 });
+      const jobs = await attachRecruiterMeta(docs);
+
+      return res.json(jobs);
+    } catch (err) {
+      console.error("GET /jobs/mine error", err);
+      return res.status(500).json({ error: "Failed to load recruiter jobs" });
+    }
+  });
+
+// GET /jobs/:id - optional helper (nice for debugging / future detail pages)
+router.get("/:id", async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const job = await Job.findById(id);
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+    const [dto] = await attachRecruiterMeta([job]);
+    return res.json(dto);
+    //return res.json(toJobDTO(job));
+  } catch (err) {
+    console.error("GET /jobs/:id error:", err);
+    return res.status(500).json({ error: "Failed to fetch job" });
+  }
+});
+
+router.use(requireSession, requireUser);
+
 /**
  * @openapi
  * /jobs:
@@ -505,221 +532,216 @@ router.get("/", async (req, res) => {
  *       201:
  *         description: Job created
  */
-router.post("/", requireSession, async (req, res) => {
-  try {
-    const didOwner = mustGetRecruiterDid(req);
-    const {
-      title,
-      company,
-      location,
-      description,
-      tags,
-      category,
-      verified,
-      postedAt,
-      workType,
-      salaryText,
-      summary,
-      purpose,
-      responsibilities,
-      interpersonal,
-      skills,
-      qualifications,
-      companyProfile,
-      feedback,
-      onChainRef,
-      vcStatusMeta,
-      status,
-    } = req.body;
+router.post("/",
+  syncRecruiterRoleFromRecruiterDoc,
+  requireRoleStateIn("recruiter", ["pending", "active", "rejected"]),
+  // requireRoleActive("recruiter"),
+  async (req, res) => {
+    try {
+      const didOwner = mustGetRecruiterDid(req);
+      const {
+        title,
+        company,
+        location,
+        description,
+        tags,
+        category,
+        verified,
+        postedAt,
+        workType,
+        salaryText,
+        summary,
+        purpose,
+        responsibilities,
+        interpersonal,
+        skills,
+        qualifications,
+        companyProfile,
+        feedback,
+        onChainRef,
+        vcStatusMeta,
+        status,
+      } = req.body;
 
-    if (!title || !company || !location || !description || !category) {
-      return res.status(400).json({
-        error: "title, company, location, description, category are required",
+      if (!title || !company || !location || !description || !category) {
+        return res.status(400).json({
+          error: "title, company, location, description, category are required",
+        });
+      }
+
+      if (!didOwner) {
+        return res.status(400).json({ error: "didOwner (recruiter DID) required" });
+      }
+
+      const trustStatus = await computeTrustStatusForJob(didOwner);
+
+      const doc = await Job.create({
+        title,
+        company,
+        location,
+        description,
+        tags: tags ?? [],
+        category,
+        didOwner,
+        verified: trustStatus === "Active",
+        trustStatus,
+        postedAt: postedAt ? new Date(postedAt) : undefined,
+        workType,
+        salaryText,
+        summary,
+        purpose,
+        responsibilities,
+        interpersonal,
+        skills,
+        qualifications,
+        companyProfile,
+        feedback,
+        onChainRef,
+        vcStatusMeta,
+        status: status ?? "published",
       });
+
+      res.status(201).json(toJobDTO(doc));
+    } catch (err: any) {
+      console.error("POST /jobs error", err);
+      res.status(500).json({ error: "Failed to create job" });
     }
-
-    if (!didOwner) {
-      return res.status(400).json({ error: "didOwner (recruiter DID) required" });
-    }
-
-    const trustStatus = await computeTrustStatusForJob(didOwner);
-
-    const doc = await Job.create({
-      title,
-      company,
-      location,
-      description,
-      tags: tags ?? [],
-      category,
-      didOwner,
-      verified: trustStatus === "Active",
-      trustStatus,
-      postedAt: postedAt ? new Date(postedAt) : undefined,
-      workType,
-      salaryText,
-      summary,
-      purpose,
-      responsibilities,
-      interpersonal,
-      skills,
-      qualifications,
-      companyProfile,
-      feedback,
-      onChainRef,
-      vcStatusMeta,
-      status: status ?? "published",
-    });
-
-    res.status(201).json(toJobDTO(doc));
-  } catch (err: any) {
-    console.error("POST /jobs error", err);
-    res.status(500).json({ error: "Failed to create job" });
-  }
-});
-
-// GET /jobs/:id - optional helper (nice for debugging / future detail pages)
-router.get("/:id", async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const job = await Job.findById(id);
-    if (!job) {
-      return res.status(404).json({ error: "Job not found" });
-    }
-    const [dto] = await attachRecruiterMeta([job]);
-    return res.json(dto);
-    //return res.json(toJobDTO(job));
-  } catch (err) {
-    console.error("GET /jobs/:id error:", err);
-    return res.status(500).json({ error: "Failed to fetch job" });
-  }
-});
+  });
 
 /**
  * PUT /jobs/:id
  * Full update of a job document.
  * Used by recruiter Job Management page when editing a job.
  */
-router.put("/:id", requireSession, async (req: Request, res: Response) => {
-  try {
+router.put("/:id",
+  syncRecruiterRoleFromRecruiterDoc,
+  requireRoleStateIn("recruiter", ["pending", "active", "rejected"]),
+  // requireRoleActive("recruiter"),
+  async (req: Request, res: Response) => {
+    try {
 
-    const {
-      title,
-      company,
-      location,
-      description,
-      tags,
-      category,
-      verified,
-      trustStatus,
-      postedAt,
-      workType,
-      salaryText,
-      summary,
-      purpose,
-      responsibilities,
-      interpersonal,
-      skills,
-      qualifications,
-      companyProfile,
-      feedback,
-      onChainRef,
-      vcStatusMeta,
-      status,
-    } = req.body;
+      const {
+        title,
+        company,
+        location,
+        description,
+        tags,
+        category,
+        verified,
+        trustStatus,
+        postedAt,
+        workType,
+        salaryText,
+        summary,
+        purpose,
+        responsibilities,
+        interpersonal,
+        skills,
+        qualifications,
+        companyProfile,
+        feedback,
+        onChainRef,
+        vcStatusMeta,
+        status,
+      } = req.body;
 
-    // same basic validation as POST
-    if (!title || !company || !location || !description || !category) {
-      return res.status(400).json({
-        error: "Missing required fields (title, company, location, description, category)",
-      });
+      // same basic validation as POST
+      if (!title || !company || !location || !description || !category) {
+        return res.status(400).json({
+          error: "Missing required fields (title, company, location, description, category)",
+        });
+      }
+
+      const recruiterDid = mustGetRecruiterDid(req);
+      const job = await Job.findById(req.params.id);
+      if (!job) return res.status(404).json({ error: "Job not found" });
+
+      if (String(job.didOwner || "") !== recruiterDid) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      job.title = title;
+      job.company = company;
+      job.location = location;
+      job.description = description;
+      job.tags = tags ?? [];
+      job.category = category;
+
+      if (typeof verified === "boolean") {
+        job.verified = verified;
+      }
+      if (trustStatus) {
+        job.trustStatus = trustStatus;
+      }
+
+      job.postedAt = postedAt ? new Date(postedAt) : job.postedAt;
+
+      job.workType = workType;
+      job.salaryText = salaryText;
+      job.summary = summary;
+      job.purpose = purpose;
+      job.responsibilities = Array.isArray(responsibilities)
+        ? responsibilities
+        : job.responsibilities;
+      job.interpersonal = Array.isArray(interpersonal)
+        ? interpersonal
+        : job.interpersonal;
+      job.skills = Array.isArray(skills) ? skills : job.skills;
+      job.qualifications = Array.isArray(qualifications)
+        ? qualifications
+        : job.qualifications;
+      job.companyProfile = companyProfile ?? job.companyProfile;
+      job.feedback = feedback ?? job.feedback;
+      job.onChainRef = onChainRef ?? job.onChainRef;
+      job.vcStatusMeta = vcStatusMeta ?? job.vcStatusMeta;
+
+      if (status) {
+        job.status = status;
+      }
+
+      await job.save();
+      return res.json(toJobDTO(job));
+    } catch (err) {
+      console.error("PUT /jobs/:id error:", err);
+      return res.status(500).json({ error: "Failed to update job" });
     }
-
-    const recruiterDid = mustGetRecruiterDid(req);
-    const job = await Job.findById(req.params.id);
-    if (!job) return res.status(404).json({ error: "Job not found" });
-
-    if (String(job.didOwner || "") !== recruiterDid) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-
-    job.title = title;
-    job.company = company;
-    job.location = location;
-    job.description = description;
-    job.tags = tags ?? [];
-    job.category = category;
-
-    if (typeof verified === "boolean") {
-      job.verified = verified;
-    }
-    if (trustStatus) {
-      job.trustStatus = trustStatus;
-    }
-
-    job.postedAt = postedAt ? new Date(postedAt) : job.postedAt;
-
-    job.workType = workType;
-    job.salaryText = salaryText;
-    job.summary = summary;
-    job.purpose = purpose;
-    job.responsibilities = Array.isArray(responsibilities)
-      ? responsibilities
-      : job.responsibilities;
-    job.interpersonal = Array.isArray(interpersonal)
-      ? interpersonal
-      : job.interpersonal;
-    job.skills = Array.isArray(skills) ? skills : job.skills;
-    job.qualifications = Array.isArray(qualifications)
-      ? qualifications
-      : job.qualifications;
-    job.companyProfile = companyProfile ?? job.companyProfile;
-    job.feedback = feedback ?? job.feedback;
-    job.onChainRef = onChainRef ?? job.onChainRef;
-    job.vcStatusMeta = vcStatusMeta ?? job.vcStatusMeta;
-
-    if (status) {
-      job.status = status;
-    }
-
-    await job.save();
-    return res.json(toJobDTO(job));
-  } catch (err) {
-    console.error("PUT /jobs/:id error:", err);
-    return res.status(500).json({ error: "Failed to update job" });
-  }
-});
+  });
 
 /**
  * PATCH /jobs/:id
  * Lightweight partial update (used mainly for closing a job).
  */
-router.patch("/:id", requireSession, async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const { status } = req.body as { status?: string };
+router.patch("/:id",
+  syncRecruiterRoleFromRecruiterDoc,
+  requireRoleStateIn("recruiter", ["pending", "active", "rejected"]),
+  // requireRoleActive("recruiter"),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { status } = req.body as { status?: string };
 
-    const recruiterDid = mustGetRecruiterDid(req);
+      const recruiterDid = mustGetRecruiterDid(req);
 
-    const job = await Job.findById(id);
-    if (!job) {
-      return res.status(404).json({ error: "Job not found" });
+      const job = await Job.findById(id);
+      if (!job) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      if (String(job.didOwner || "") !== recruiterDid) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      if (status) {
+        job.status = status as any;
+      }
+
+      await job.save();
+      return res.json(toJobDTO(job));
+    } catch (err) {
+      console.error("PATCH /jobs/:id error:", err);
+      return res.status(500).json({ error: "Failed to patch job" });
     }
-
-    if (String(job.didOwner || "") !== recruiterDid) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-
-    if (status) {
-      job.status = status as any;
-    }
-
-    await job.save();
-    return res.json(toJobDTO(job));
-  } catch (err) {
-    console.error("PATCH /jobs/:id error:", err);
-    return res.status(500).json({ error: "Failed to patch job" });
-  }
-});
+  });
 
 
 export default router;

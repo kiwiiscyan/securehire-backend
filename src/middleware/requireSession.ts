@@ -2,7 +2,7 @@
 import type { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 
-type SessionPayload = {
+export type SessionPayload = {
   did?: string;
   privyUserId?: string;
   email?: string;

@@ -7,10 +7,15 @@ import Job from "../models/Jobs";
 import Seeker from "../models/Seeker";
 import Recruiter from "../models/Recruiter";
 import { requireSession, getSession } from "../middleware/requireSession";
+import { requireUser } from "../middleware/requireUser";
+import { syncRecruiterRoleFromRecruiterDoc } from "../middleware/syncRecruiterRoleFromRecruiterDoc";
+import { requireRoleStateIn, requireRoleActive } from "../middleware/rbac";
+import { syncSeekerRoleFromSeekerDoc } from "../middleware/syncSeekerRoleFromSeekerDoc";
+import { requireSeekerOnboarded } from "../middleware/requireSeekerOnboarded";
 
 const router = Router();
 
-router.use(requireSession);
+router.use(requireSession, requireUser);
 
 // ✅ FIX: Clean VC helper - removes nested @context
 function cleanVcForStorage(vc: any): any {
@@ -149,122 +154,126 @@ async function filterActiveSharedProofs(sharedProofs: any[]) {
  *     summary: Create a job application (seeker -> recruiter)
  *     tags: [Applications]
  */
-router.post('/', async (req, res) => {
-  try {
-    const s = getSession(req);
-    if (!s?.did) return res.status(401).json({ error: "Unauthenticated" });
-
-    const { jobId, recruiterDid, sharedVcIds } = req.body;
-
-    // ✅ seekerDid must come from session, not body
-    const seekerDid = String(s.did).trim();
-
-    if (!jobId || !recruiterDid) {
-      return res.status(400).json({ error: "jobId, recruiterDid required" });
-    }
-
-    // Prevent duplicate applications for the same seeker + job
-    const existing = await Application.findOne({ jobId, seekerDid });
-    if (existing) {
-      return res.status(200).json({
-        alreadyApplied: true,
-        application: existing,
-      });
-    }
-
-    const appDoc = await Application.create({
-      jobId,
-      seekerDid,
-      recruiterDid,
-      sharedVcIds: Array.isArray(sharedVcIds) ? sharedVcIds : [],
-    });
-
-    // VC-level sharing:
-    // If seeker selected specific credentialIds, attach the FULL VCs (untouched)
-    // into SharedProof so recruiter can verify them normally.
-    const selectedIds: string[] = Array.isArray(sharedVcIds) ? sharedVcIds : [];
-    if (selectedIds.length > 0) {
-      // Security: ensure these credentials belong to the seeker
-      const creds = await Credential.find({
-        credentialId: { $in: selectedIds },
-        subjectDid: seekerDid,
-        status: "active",
-      }).lean();
-
-      const byId = new Map<string, any>();
-      creds.forEach((c: any) => byId.set(c.credentialId, c));
-
-      const validSelected = selectedIds.filter((id) => byId.has(id));
-
-      if (validSelected.length > 0) {
-        const bulkOps = validSelected.map((credId) => {
-          const c: any = byId.get(credId);
-          const vcObj = deepCloneVcRawUntouched(c?.vcRaw);
-
-          return {
-            updateOne: {
-              filter: {
-                applicationId: appDoc._id.toString(),
-                vcId: credId,
-              },
-              update: {
-                $set: {
-                  applicationId: appDoc._id.toString(),
-                  jobId,
-                  vcId: credId,
-                  seekerDid,
-                  recruiterDid,
-                  // No derived proof anymore:
-                  derivedProof: null,
-                  // Store full VC as "revealedDocument" for backward compatibility
-                  revealedDocument: vcObj,
-                  nonce: null,
-                },
-              },
-              upsert: true,
-            },
-          };
-        });
-
-        await SharedProof.bulkWrite(bulkOps);
-
-        await Application.findByIdAndUpdate(appDoc._id, {
-          $set: { sharedVcIds: validSelected },
-        });
-      }
-    }
-
-    // Attach lightweight seeker profile snapshot for recruiter quick view
+router.post('/',
+  syncSeekerRoleFromSeekerDoc,
+  requireSeekerOnboarded,
+  requireRoleActive("seeker"),
+  async (req, res) => {
     try {
-      const seeker = await Seeker.findOne({ did: seekerDid }).lean();
-      if (seeker) {
-        await Application.findByIdAndUpdate(appDoc._id, {
-          $set: {
-            seekerProfile: {
-              name: seeker.name,
-              email: seeker.email,
-              homeLocation: seeker.homeLocation,
-              skills: (seeker as any)?.profile?.skills ?? [],
-              languages: (seeker as any)?.profile?.languages ?? [],
-              resumeInfo: (seeker as any)?.profile?.resumeInfo ?? undefined,
-            },
-          },
+      const s = getSession(req);
+      if (!s?.did) return res.status(401).json({ error: "Unauthenticated" });
+
+      const { jobId, recruiterDid, sharedVcIds } = req.body;
+
+      // ✅ seekerDid must come from session, not body
+      const seekerDid = String(s.did).trim();
+
+      if (!jobId || !recruiterDid) {
+        return res.status(400).json({ error: "jobId, recruiterDid required" });
+      }
+
+      // Prevent duplicate applications for the same seeker + job
+      const existing = await Application.findOne({ jobId, seekerDid });
+      if (existing) {
+        return res.status(200).json({
+          alreadyApplied: true,
+          application: existing,
         });
       }
-    } catch (e) {
-      console.warn("POST /applications failed to attach seeker snapshot", e);
-    }
 
-    res.status(201).json({
-      ...appDoc.toObject(),
-      sharedVcsAttached: Array.isArray(sharedVcIds) ? sharedVcIds.length : 0,
-      alreadyApplied: false,
-    });
-  } catch (err: any) {
-    console.error("POST /applications error:", err);
-    return res.status(500).json({ error: "Failed to create application" });
-  }
-});
+      const appDoc = await Application.create({
+        jobId,
+        seekerDid,
+        recruiterDid,
+        sharedVcIds: Array.isArray(sharedVcIds) ? sharedVcIds : [],
+      });
+
+      // VC-level sharing:
+      // If seeker selected specific credentialIds, attach the FULL VCs (untouched)
+      // into SharedProof so recruiter can verify them normally.
+      const selectedIds: string[] = Array.isArray(sharedVcIds) ? sharedVcIds : [];
+      if (selectedIds.length > 0) {
+        // Security: ensure these credentials belong to the seeker
+        const creds = await Credential.find({
+          credentialId: { $in: selectedIds },
+          subjectDid: seekerDid,
+          status: "active",
+        }).lean();
+
+        const byId = new Map<string, any>();
+        creds.forEach((c: any) => byId.set(c.credentialId, c));
+
+        const validSelected = selectedIds.filter((id) => byId.has(id));
+
+        if (validSelected.length > 0) {
+          const bulkOps = validSelected.map((credId) => {
+            const c: any = byId.get(credId);
+            const vcObj = deepCloneVcRawUntouched(c?.vcRaw);
+
+            return {
+              updateOne: {
+                filter: {
+                  applicationId: appDoc._id.toString(),
+                  vcId: credId,
+                },
+                update: {
+                  $set: {
+                    applicationId: appDoc._id.toString(),
+                    jobId,
+                    vcId: credId,
+                    seekerDid,
+                    recruiterDid,
+                    // No derived proof anymore:
+                    derivedProof: null,
+                    // Store full VC as "revealedDocument" for backward compatibility
+                    revealedDocument: vcObj,
+                    nonce: null,
+                  },
+                },
+                upsert: true,
+              },
+            };
+          });
+
+          await SharedProof.bulkWrite(bulkOps);
+
+          await Application.findByIdAndUpdate(appDoc._id, {
+            $set: { sharedVcIds: validSelected },
+          });
+        }
+      }
+
+      // Attach lightweight seeker profile snapshot for recruiter quick view
+      try {
+        const seeker = await Seeker.findOne({ did: seekerDid }).lean();
+        if (seeker) {
+          await Application.findByIdAndUpdate(appDoc._id, {
+            $set: {
+              seekerProfile: {
+                name: seeker.name,
+                email: seeker.email,
+                homeLocation: seeker.homeLocation,
+                skills: (seeker as any)?.profile?.skills ?? [],
+                languages: (seeker as any)?.profile?.languages ?? [],
+                resumeInfo: (seeker as any)?.profile?.resumeInfo ?? undefined,
+              },
+            },
+          });
+        }
+      } catch (e) {
+        console.warn("POST /applications failed to attach seeker snapshot", e);
+      }
+
+      res.status(201).json({
+        ...appDoc.toObject(),
+        sharedVcsAttached: Array.isArray(sharedVcIds) ? sharedVcIds.length : 0,
+        alreadyApplied: false,
+      });
+    } catch (err: any) {
+      console.error("POST /applications error:", err);
+      return res.status(500).json({ error: "Failed to create application" });
+    }
+  });
 
 /**
  * @openapi
@@ -273,98 +282,36 @@ router.post('/', async (req, res) => {
  *     summary: List applications for a given seeker DID
  *     tags: [Applications]
  */
-router.get('/by-seeker', async (req, res) => {
-  const s = getSession(req);
-  if (!s) return res.status(401).json({ error: "Unauthenticated" });
-
-  const seekerDid = String(s.did).trim();
-  if (!seekerDid) return res.status(401).json({ error: "Missing DID in session" });
-
-  const sessionDid = String(s.did || "").trim();
-  if (sessionDid && sessionDid !== seekerDid) {
-    return res.status(403).json({ error: "Forbidden" });
-  }
-
-  const list = await Application.find({ seekerDid }).sort({ createdAt: -1 }).lean();
-
-  const jobIds = Array.from(new Set(list.map((app: any) => app.jobId)));
-  const jobs = jobIds.length
-    ? await Job.find({ _id: { $in: jobIds } }).lean()
-    : [];
-  const jobById = new Map<string, any>();
-  jobs.forEach((j: any) => jobById.set(j._id.toString(), j));
-
-  const mapped = list.map((app: any) => {
-    const job = jobById.get(app.jobId);
-    return {
-      ...app,
-      uiStatus: toUiStatus(app.status),
-      job: job
-        ? {
-          id: job._id.toString(),
-          title: job.title,
-          company: job.company,
-          location: job.location,
-          workType: job.workType,
-          salaryText: job.salaryText,
-          postedAt: job.postedAt ?? job.createdAt,
-        }
-        : null,
-    };
-  });
-
-  res.json(mapped);
-});
-
-/**
- * GET /applications/by-recruiter?recruiterDid=...
- */
-router.get("/by-recruiter", async (req, res) => {
-  try {
+router.get('/by-seeker',
+  syncSeekerRoleFromSeekerDoc,
+  requireSeekerOnboarded,
+  requireRoleActive("seeker"),
+  async (req, res) => {
     const s = getSession(req);
-    if (!s?.did) return res.status(401).json({ error: "Unauthenticated" });
+    if (!s) return res.status(401).json({ error: "Unauthenticated" });
 
-    const recruiterDid = String(s.did).trim();
-    if (req.query?.recruiterDid) {
-      return res.status(400).json({ error: "Do not send recruiterDid. Session-only." });
+    const seekerDid = String(s.did).trim();
+    if (!seekerDid) return res.status(401).json({ error: "Missing DID in session" });
+
+    const sessionDid = String(s.did || "").trim();
+    if (sessionDid && sessionDid !== seekerDid) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
-    const list = await Application.find({ recruiterDid })
-      .sort({ createdAt: -1 })
-      .lean();
+    const list = await Application.find({ seekerDid }).sort({ createdAt: -1 }).lean();
 
-    if (!list.length) {
-      return res.json([]);
-    }
-
-    const jobIds = Array.from(new Set(list.map((a: any) => a.jobId)));
-    const seekerDids = Array.from(new Set(list.map((a: any) => a.seekerDid)));
-
-    const [jobs, seekers] = await Promise.all([
-      jobIds.length
-        ? Job.find({ _id: { $in: jobIds } }).lean()
-        : [],
-      seekerDids.length
-        ? Seeker.find({ did: { $in: seekerDids } }).lean()
-        : [],
-    ]);
-
+    const jobIds = Array.from(new Set(list.map((app: any) => app.jobId)));
+    const jobs = jobIds.length
+      ? await Job.find({ _id: { $in: jobIds } }).lean()
+      : [];
     const jobById = new Map<string, any>();
     jobs.forEach((j: any) => jobById.set(j._id.toString(), j));
 
-    const seekerByDid = new Map<string, any>();
-    seekers.forEach((s: any) => {
-      if (s.did) seekerByDid.set(s.did, s);
-    });
-
     const mapped = list.map((app: any) => {
       const job = jobById.get(app.jobId);
-      const seeker = seekerByDid.get(app.seekerDid);
-
       return {
         ...app,
         uiStatus: toUiStatus(app.status),
-        jobTitle: job?.title,
         job: job
           ? {
             id: job._id.toString(),
@@ -376,22 +323,91 @@ router.get("/by-recruiter", async (req, res) => {
             postedAt: job.postedAt ?? job.createdAt,
           }
           : null,
-        seeker: seeker
-          ? {
-            name: seeker.name,
-            email: seeker.email,
-            homeLocation: seeker.homeLocation,
-          }
-          : null,
       };
     });
 
-    return res.json(mapped);
-  } catch (err) {
-    console.error("GET /applications/by-recruiter error:", err);
-    return res.status(500).json({ error: "Failed to load applications" });
-  }
-});
+    res.json(mapped);
+  });
+
+/**
+ * GET /applications/by-recruiter?recruiterDid=...
+ */
+router.get("/by-recruiter",
+  syncRecruiterRoleFromRecruiterDoc,
+  requireRoleStateIn("recruiter", ["pending", "active", "rejected"]),
+  async (req, res) => {
+    try {
+      const s = getSession(req);
+      if (!s?.did) return res.status(401).json({ error: "Unauthenticated" });
+
+      const recruiterDid = String(s.did).trim();
+      if (req.query?.recruiterDid) {
+        return res.status(400).json({ error: "Do not send recruiterDid. Session-only." });
+      }
+
+      const list = await Application.find({ recruiterDid })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      if (!list.length) {
+        return res.json([]);
+      }
+
+      const jobIds = Array.from(new Set(list.map((a: any) => a.jobId)));
+      const seekerDids = Array.from(new Set(list.map((a: any) => a.seekerDid)));
+
+      const [jobs, seekers] = await Promise.all([
+        jobIds.length
+          ? Job.find({ _id: { $in: jobIds } }).lean()
+          : [],
+        seekerDids.length
+          ? Seeker.find({ did: { $in: seekerDids } }).lean()
+          : [],
+      ]);
+
+      const jobById = new Map<string, any>();
+      jobs.forEach((j: any) => jobById.set(j._id.toString(), j));
+
+      const seekerByDid = new Map<string, any>();
+      seekers.forEach((s: any) => {
+        if (s.did) seekerByDid.set(s.did, s);
+      });
+
+      const mapped = list.map((app: any) => {
+        const job = jobById.get(app.jobId);
+        const seeker = seekerByDid.get(app.seekerDid);
+
+        return {
+          ...app,
+          uiStatus: toUiStatus(app.status),
+          jobTitle: job?.title,
+          job: job
+            ? {
+              id: job._id.toString(),
+              title: job.title,
+              company: job.company,
+              location: job.location,
+              workType: job.workType,
+              salaryText: job.salaryText,
+              postedAt: job.postedAt ?? job.createdAt,
+            }
+            : null,
+          seeker: seeker
+            ? {
+              name: seeker.name,
+              email: seeker.email,
+              homeLocation: seeker.homeLocation,
+            }
+            : null,
+        };
+      });
+
+      return res.json(mapped);
+    } catch (err) {
+      console.error("GET /applications/by-recruiter error:", err);
+      return res.status(500).json({ error: "Failed to load applications" });
+    }
+  });
 
 /**
  * GET /applications/by-job?jobId=...
@@ -569,116 +585,123 @@ router.get("/:id", async (req, res) => {
 });
 
 // PATCH /applications/:id/status
-router.patch("/:id/status", async (req, res) => {
-  try {
-    const sessionDid = mustGetDid(req);
+router.patch("/:id/status",
+  syncRecruiterRoleFromRecruiterDoc,
+  requireRoleActive("recruiter"),
+  async (req, res) => {
+    try {
+      const sessionDid = mustGetDid(req);
 
-    const { id } = req.params;
-    const { status, interview } = req.body as {
-      status?: "submitted" | "withdrawn" | "shortlisted" | "rejected" | "hired";
-      interview?: any;
-    };
+      const { id } = req.params;
+      const { status, interview } = req.body as {
+        status?: "submitted" | "withdrawn" | "shortlisted" | "rejected" | "hired";
+        interview?: any;
+      };
 
-    if (!status) return res.status(400).json({ error: "status required" });
+      if (!status) return res.status(400).json({ error: "status required" });
 
-    const app = await Application.findById(id);
-    if (!app) return res.status(404).json({ error: "Application not found" });
+      const app = await Application.findById(id);
+      if (!app) return res.status(404).json({ error: "Application not found" });
 
-    if (String(app.recruiterDid) !== sessionDid) {
-      return res.status(403).json({ error: "Forbidden" });
+      if (String(app.recruiterDid) !== sessionDid) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      app.status = status;
+      if (interview) {
+        app.interview = interview;
+      }
+
+      await app.save();
+      return res.json({ ok: true, application: { ...app.toObject(), uiStatus: toUiStatus(status) } });
+    } catch (err) {
+      console.error("PATCH /applications/:id/status error:", err);
+      return res.status(500).json({ error: "Failed to update application status" });
     }
-
-    app.status = status;
-    if (interview) {
-      app.interview = interview;
-    }
-
-    await app.save();
-    return res.json({ ok: true, application: { ...app.toObject(), uiStatus: toUiStatus(status) } });
-  } catch (err) {
-    console.error("PATCH /applications/:id/status error:", err);
-    return res.status(500).json({ error: "Failed to update application status" });
-  }
-});
+  });
 
 // PATCH /applications/:id/shared-vcs
-router.patch("/:id/shared-vcs", async (req, res) => {
-  try {
-    const sessionDid = mustGetDid(req);
+router.patch("/:id/shared-vcs",
+  syncSeekerRoleFromSeekerDoc,
+  requireSeekerOnboarded,
+  requireRoleActive("seeker"),
+  async (req, res) => {
+    try {
+      const sessionDid = mustGetDid(req);
 
-    const { id } = req.params;
-    const { sharedVcIds } = req.body as { sharedVcIds?: string[] };
+      const { id } = req.params;
+      const { sharedVcIds } = req.body as { sharedVcIds?: string[] };
 
-    const app = await Application.findById(id);
-    if (!app) return res.status(404).json({ error: "Application not found" });
+      const app = await Application.findById(id);
+      if (!app) return res.status(404).json({ error: "Application not found" });
 
-    if (String(app.seekerDid) !== sessionDid) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
+      if (String(app.seekerDid) !== sessionDid) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
 
-    // Optional: only allow while submitted
-    if (app.status !== "submitted") {
-      return res.status(409).json({ error: "Cannot edit shared VCs after review begins" });
-    }
+      // Optional: only allow while submitted
+      if (app.status !== "submitted") {
+        return res.status(409).json({ error: "Cannot edit shared VCs after review begins" });
+      }
 
-    const requested: string[] = Array.isArray(sharedVcIds) ? sharedVcIds : [];
+      const requested: string[] = Array.isArray(sharedVcIds) ? sharedVcIds : [];
 
-    // 1) Filter to only VCs that belong to seeker + are active
-    const creds = await Credential.find({
-      credentialId: { $in: requested },
-      subjectDid: app.seekerDid,
-      status: "active",
-    }).lean();
+      // 1) Filter to only VCs that belong to seeker + are active
+      const creds = await Credential.find({
+        credentialId: { $in: requested },
+        subjectDid: app.seekerDid,
+        status: "active",
+      }).lean();
 
-    const byId = new Map<string, any>();
-    creds.forEach((c: any) => byId.set(c.credentialId, c));
-    const validSelected = requested.filter((vcId) => byId.has(vcId));
+      const byId = new Map<string, any>();
+      creds.forEach((c: any) => byId.set(c.credentialId, c));
+      const validSelected = requested.filter((vcId) => byId.has(vcId));
 
-    // 2) Delete proofs that are no longer selected
-    await SharedProof.deleteMany({
-      applicationId: app._id.toString(),
-      vcId: { $nin: validSelected },
-    });
-
-    // 3) Upsert proofs for newly selected ids
-    if (validSelected.length > 0) {
-      const bulkOps = validSelected.map((credId) => {
-        const c: any = byId.get(credId);
-        const vcObj = deepCloneVcRawUntouched(c?.vcRaw);
-
-        return {
-          updateOne: {
-            filter: { applicationId: app._id.toString(), vcId: credId },
-            update: {
-              $set: {
-                applicationId: app._id.toString(),
-                jobId: app.jobId,
-                vcId: credId,
-                seekerDid: app.seekerDid,
-                recruiterDid: app.recruiterDid,
-                derivedProof: null,
-                nonce: null,
-                revealedDocument: vcObj,
-              },
-            },
-            upsert: true,
-          },
-        };
+      // 2) Delete proofs that are no longer selected
+      await SharedProof.deleteMany({
+        applicationId: app._id.toString(),
+        vcId: { $nin: validSelected },
       });
 
-      await SharedProof.bulkWrite(bulkOps);
+      // 3) Upsert proofs for newly selected ids
+      if (validSelected.length > 0) {
+        const bulkOps = validSelected.map((credId) => {
+          const c: any = byId.get(credId);
+          const vcObj = deepCloneVcRawUntouched(c?.vcRaw);
+
+          return {
+            updateOne: {
+              filter: { applicationId: app._id.toString(), vcId: credId },
+              update: {
+                $set: {
+                  applicationId: app._id.toString(),
+                  jobId: app.jobId,
+                  vcId: credId,
+                  seekerDid: app.seekerDid,
+                  recruiterDid: app.recruiterDid,
+                  derivedProof: null,
+                  nonce: null,
+                  revealedDocument: vcObj,
+                },
+              },
+              upsert: true,
+            },
+          };
+        });
+
+        await SharedProof.bulkWrite(bulkOps);
+      }
+
+      // 4) Save canonical ids
+      app.sharedVcIds = validSelected;
+      await app.save();
+
+      return res.json({ ok: true, sharedVcIds: validSelected });
+    } catch (err) {
+      console.error("PATCH /applications/:id/shared-vcs error:", err);
+      return res.status(500).json({ error: "Failed to update shared VCs" });
     }
-
-    // 4) Save canonical ids
-    app.sharedVcIds = validSelected;
-    await app.save();
-
-    return res.json({ ok: true, sharedVcIds: validSelected });
-  } catch (err) {
-    console.error("PATCH /applications/:id/shared-vcs error:", err);
-    return res.status(500).json({ error: "Failed to update shared VCs" });
-  }
-});
+  });
 
 export default router;
 

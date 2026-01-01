@@ -7,6 +7,11 @@ import SharedProof from "../models/Proofs";
 import { zkService } from "../services/zk.service";
 import { requireSession } from "../middleware/requireSession";
 import { mustGetSession, mustGetDid } from "../auth/identity";
+import { requireUser } from "../middleware/requireUser";
+import { guardRecruiterBootstrap } from "../middleware/guardRecruiterBootstrap";
+import { requireRecruiterOnboarded } from "../middleware/requireRecruiterOnboarded";
+import { syncRecruiterRoleFromRecruiterDoc } from "../middleware/syncRecruiterRoleFromRecruiterDoc";
+import { requireRoleStateIn, requireRoleActive } from "../middleware/rbac";
 
 const router = express.Router();
 
@@ -46,57 +51,6 @@ function toRecruiterApi(doc: IRecruiter) {
   };
 }
 
-/**
- * GET /recruiters/me  (session-only)
- * Used by:
- *  - RecruiterAuthCard
- *  - Onboarding page initial fetch
- */
-router.get("/me", requireSession, async (req, res) => {
-  try {
-    const s = mustGetSession(req);
-    const did = s.did?.trim();
-    const email = s.email?.trim().toLowerCase();
-
-    if (req.query?.did || req.query?.email) {
-      return res.status(400).json({ error: "Do not send did/email in query. Session-only." });
-    }
-
-    let recruiter = null;
-    if (did) recruiter = await Recruiter.findOne({ did });
-    if (!recruiter && email) recruiter = await Recruiter.findOne({ contactEmail: email });
-
-    if (!recruiter) return res.status(404).json({ error: "Recruiter not found" });
-    return res.json(toRecruiterApi(recruiter));
-  } catch (e) {
-    return res.status(401).json({ error: "Unauthenticated" });
-  }
-});
-
-// Update recruiter basic profile (org info) without touching KYC/docs.
-router.patch("/me", requireSession, async (req, res) => {
-  try {
-    const s = mustGetSession(req);
-    if (!s.did) return res.status(401).json({ error: "Missing DID in session" });
-
-    const recruiter = await Recruiter.findOne({ did: s.did });
-    if (!recruiter) return res.status(404).json({ error: "Recruiter not found" });
-
-    const { orgLegalName, contactEmail, website } = req.body || {};
-
-    if (typeof orgLegalName === "string") recruiter.orgLegalName = orgLegalName;
-    if (typeof contactEmail === "string") recruiter.contactEmail = contactEmail;
-
-    if (typeof website === "string") recruiter.website = website;
-    else if (website === null) recruiter.website = undefined;
-
-    await recruiter.save();
-    return res.json(toRecruiterApi(recruiter));
-  } catch (e) {
-    return res.status(401).json({ error: "Unauthenticated" });
-  }
-});
-
 // GET /recruiters/public/:id
 router.get("/public/:id", async (req, res) => {
   const id = String(req.params.id || "").trim();
@@ -130,6 +84,67 @@ router.get("/public/:id", async (req, res) => {
         : undefined,
     },
   });
+});               // none -> pending (bootstrap)
+
+router.use(requireSession, requireUser);
+router.use(syncRecruiterRoleFromRecruiterDoc);    // badge.status -> roles.recruiter
+// If role is none, only allow bootstrap endpoints
+router.use(
+  guardRecruiterBootstrap([
+    "/me",
+    "/",          // POST /recruiters (create doc)
+    "/onboarding" // submit onboarding
+  ])
+);
+/**
+ * GET /recruiters/me  (session-only)
+ * Used by:
+ *  - RecruiterAuthCard
+ *  - Onboarding page initial fetch
+ */
+// GET /recruiters/me (session-only)
+router.get("/me", async (req, res) => {
+  try {
+    const s = mustGetSession(req);
+    const did = s.did?.trim();
+    const email = s.email?.trim().toLowerCase();
+
+    if (req.query?.did || req.query?.email) {
+      return res.status(400).json({ error: "Do not send did/email in query. Session-only." });
+    }
+
+    // 1) Find recruiter doc (if any)
+    let recruiter = null;
+    if (did) recruiter = await Recruiter.findOne({ did });
+    if (!recruiter && email) recruiter = await Recruiter.findOne({ contactEmail: email });
+
+    // 2) If no recruiter doc yet => bootstrap response (exists=false)
+    if (!recruiter) {
+      const user = (req as any).user;
+      return res.json({
+        exists: false,
+        onboarded: false,
+        role: user?.roles?.recruiter ?? "none",
+        badge: { status: "None" },
+      });
+    }
+
+    // 3) If recruiter exists but not onboarded => bootstrap response (exists=true)
+    if (!recruiter.onboarded) {
+      const user = (req as any).user;
+      return res.json({
+        exists: true,
+        onboarded: false,
+        role: user?.roles?.recruiter ?? "none",
+        badge: { status: (recruiter.badge as any)?.status ?? "None" },
+      });
+    }
+
+    // 4) Onboarded => return full recruiter API shape
+    return res.json(toRecruiterApi(recruiter));
+  } catch {
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
 });
 
 /**
@@ -137,7 +152,7 @@ router.get("/public/:id", async (req, res) => {
  * Body: { did: string; email?: string }
  * Used by onboarding page when recruiter doc doesn't exist yet.
  */
-router.post("/", requireSession, async (req, res) => {
+router.post("/", async (req, res) => {
   try {
     const s = mustGetSession(req);
     if (!s.did) return res.status(401).json({ error: "Missing DID in session" });
@@ -173,7 +188,7 @@ router.post("/", requireSession, async (req, res) => {
  * Called by onboarding page Step 3 "Submit for Verification".
  * Sets kycStatus="pending" and onboarded=true.
  */
-router.post("/onboarding", requireSession, async (req, res) => {
+router.post("/onboarding", async (req, res) => {
   try {
     const s = mustGetSession(req);
     if (!s.did) return res.status(401).json({ error: "Missing DID in session" });
@@ -183,8 +198,17 @@ router.post("/onboarding", requireSession, async (req, res) => {
       return res.status(400).json({ error: "orgLegalName and contactEmail are required" });
     }
 
-    const recruiter = await Recruiter.findOne({ did: s.did });
-    if (!recruiter) return res.status(404).json({ error: "Recruiter not found" });
+    let recruiter = await Recruiter.findOne({ did: s.did });
+
+    if (!recruiter) {
+      recruiter = new Recruiter({
+        did: s.did,
+        contactEmail: s.email,   // optional seed
+        onboarded: false,
+        kycStatus: "none",
+        badge: { verified: false, status: "None" },
+      });
+    }
 
     recruiter.orgLegalName = orgLegalName;
     recruiter.website = website;
@@ -204,13 +228,40 @@ router.post("/onboarding", requireSession, async (req, res) => {
     };
 
     await recruiter.save();
+    (req as any).recruiter = recruiter;
     return res.json(toRecruiterApi(recruiter));
   } catch (e) {
     return res.status(401).json({ error: "Unauthenticated" });
   }
 });
 
-router.post("/verify-vc", requireSession, async (req, res) => {
+router.use(requireRoleStateIn("recruiter", ["pending", "active", "rejected"]));
+router.use(requireRecruiterOnboarded);
+// Update recruiter basic profile (org info) without touching KYC/docs.
+router.patch("/me", async (req, res) => {
+  try {
+    const s = mustGetSession(req);
+    if (!s.did) return res.status(401).json({ error: "Missing DID in session" });
+
+    const recruiter = await Recruiter.findOne({ did: s.did });
+    if (!recruiter) return res.status(404).json({ error: "Recruiter not found" });
+
+    const { orgLegalName, contactEmail, website } = req.body || {};
+
+    if (typeof orgLegalName === "string") recruiter.orgLegalName = orgLegalName;
+    if (typeof contactEmail === "string") recruiter.contactEmail = contactEmail;
+
+    if (typeof website === "string") recruiter.website = website;
+    else if (website === null) recruiter.website = undefined;
+
+    await recruiter.save();
+    return res.json(toRecruiterApi(recruiter));
+  } catch (e) {
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+});
+
+router.post("/verify-vc", requireRoleActive("recruiter"), async (req, res) => {
   try {
     const recruiterDid = mustGetDid(req);
 

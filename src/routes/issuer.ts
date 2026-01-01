@@ -15,11 +15,14 @@ import {
 } from "../services/vc.service";
 import { ensureBbsKeyForIssuer } from "../services/bbsKey.service";
 import { requireSession } from "../middleware/requireSession";
-import { mustGetSession, mustGetDid, mustGetEmail } from "../auth/identity";
+import { mustGetSession, mustGetDid } from "../auth/identity";
+import { requireUser } from "../middleware/requireUser";
+import { syncIssuerRoleFromIssuerDoc } from "../middleware/syncIssuerRoleFromIssuerDoc";
+import { requireRoleStateIn, requireRoleActive } from "../middleware/rbac";
 
 const router = Router();
 
-router.use(requireSession);
+router.use(requireSession, requireUser, syncIssuerRoleFromIssuerDoc);
 
 /**
  * Helper type: per-section structured claims that also carries credentialType.
@@ -182,65 +185,67 @@ function toRecruiterApi(doc: IRecruiter) {
  *       400:
  *         description: Bad request
  */
-router.post("/vc/issue", async (req: Request, res: Response) => {
-  try {
-    const s = mustGetSession(req);
-    const did = s.did?.trim();
-    const email = s.email?.trim().toLowerCase();
+router.post("/vc/issue",
+  requireRoleActive("issuer"),
+  async (req: Request, res: Response) => {
+    try {
+      const s = mustGetSession(req);
+      const did = s.did?.trim();
+      const email = s.email?.trim().toLowerCase();
 
-    const issuer =
-      (did && (await Issuer.findOne({ did }))) ||
-      (email && (await Issuer.findOne({ email })));
+      const issuer =
+        (did && (await Issuer.findOne({ did }))) ||
+        (email && (await Issuer.findOne({ email })));
 
-    if (!issuer) return res.status(404).json({ error: "Issuer not found" });
+      if (!issuer) return res.status(404).json({ error: "Issuer not found" });
 
-    const { subjectDid, claims } = req.body;
-    if (!subjectDid || !claims) {
-      return res.status(400).json({ error: "subjectDid and claims are required" });
+      const { subjectDid, claims } = req.body;
+      if (!subjectDid || !claims) {
+        return res.status(400).json({ error: "subjectDid and claims are required" });
+      }
+
+      const issuerDid = issuer.did;
+
+      const section =
+        (claims.section as "career" | "education" | "certification" | "recruiter") ??
+        "recruiter";
+
+      const credentialType =
+        (claims.credentialType as CredentialType) ?? "GenericCredential";
+
+      const title =
+        (claims.title as string) ??
+        `Verified ${credentialType} from ${issuerDid}`;
+
+      const { vcId, vc } = await issueSimpleVc({
+        subjectDid,
+        issuerDid,
+        section,
+        title,
+        credentialType,
+        claims,
+      });
+
+      const cred = await Credential.create({
+        credentialId: vcId,
+        subjectDid,
+        issuerDid,
+        title,
+        type: vc.type,
+        issuanceDate: new Date(vc.issuanceDate),
+        status: "active",
+        vcRaw: vc,
+      });
+
+      return res.status(201).json({
+        ok: true,
+        credential: cred,
+      });
+    } catch (err) {
+      console.error("POST /issuer/vc/issue error:", err);
+      return res.status(500).json({ error: "Failed to issue VC" });
     }
-
-    const issuerDid = issuer.did;
-
-    const section =
-      (claims.section as "career" | "education" | "certification" | "recruiter") ??
-      "recruiter";
-
-    const credentialType =
-      (claims.credentialType as CredentialType) ?? "GenericCredential";
-
-    const title =
-      (claims.title as string) ??
-      `Verified ${credentialType} from ${issuerDid}`;
-
-    const { vcId, vc } = await issueSimpleVc({
-      subjectDid,
-      issuerDid,
-      section,
-      title,
-      credentialType,
-      claims,
-    });
-
-    const cred = await Credential.create({
-      credentialId: vcId,
-      subjectDid,
-      issuerDid,
-      title,
-      type: vc.type,
-      issuanceDate: new Date(vc.issuanceDate),
-      status: "active",
-      vcRaw: vc,
-    });
-
-    return res.status(201).json({
-      ok: true,
-      credential: cred,
-    });
-  } catch (err) {
-    console.error("POST /issuer/vc/issue error:", err);
-    return res.status(500).json({ error: "Failed to issue VC" });
-  }
-});
+  });
 
 /**
  * GET /issuer/vc
@@ -283,48 +288,49 @@ router.get("/vc", async (req, res) => {
  *       404:
  *         description: VC not found
  */
-router.get("/vc/:credentialId", async (req: Request, res: Response) => {
-  try {
-    const { credentialId } = req.params;
-    const cred = await Credential.findOne({ credentialId }).lean();
+router.get("/vc/:credentialId",
+  async (req: Request, res: Response) => {
+    try {
+      const { credentialId } = req.params;
+      const cred = await Credential.findOne({ credentialId }).lean();
 
-    if (!cred) {
-      return res.status(404).json({ error: "Credential not found" });
-    }
-
-    if ((cred as any).vcRaw) {
-      const raw = (cred as any).vcRaw;
-
-      if (typeof raw === "object") {
-        return res.json(raw);
+      if (!cred) {
+        return res.status(404).json({ error: "Credential not found" });
       }
 
-      if (typeof raw === "string") {
-        try {
-          const parsed = JSON.parse(raw);
-          return res.json(parsed);
-        } catch {
-          return res.json({ vcRaw: raw });
+      if ((cred as any).vcRaw) {
+        const raw = (cred as any).vcRaw;
+
+        if (typeof raw === "object") {
+          return res.json(raw);
         }
+
+        if (typeof raw === "string") {
+          try {
+            const parsed = JSON.parse(raw);
+            return res.json(parsed);
+          } catch {
+            return res.json({ vcRaw: raw });
+          }
+        }
+
+        // Fallback
+        return res.json({ vcRaw: raw });
       }
 
-      // Fallback
-      return res.json({ vcRaw: raw });
+      return res.json({
+        id: cred.credentialId,
+        type: cred.type,
+        issuerDid: cred.issuerDid,
+        subjectDid: cred.subjectDid,
+        issuanceDate: cred.issuanceDate,
+        status: cred.status,
+      });
+    } catch (err) {
+      console.error("GET /issuer/vc/:credentialId error:", err);
+      return res.status(500).json({ error: "Failed to fetch VC" });
     }
-
-    return res.json({
-      id: cred.credentialId,
-      type: cred.type,
-      issuerDid: cred.issuerDid,
-      subjectDid: cred.subjectDid,
-      issuanceDate: cred.issuanceDate,
-      status: cred.status,
-    });
-  } catch (err) {
-    console.error("GET /issuer/vc/:credentialId error:", err);
-    return res.status(500).json({ error: "Failed to fetch VC" });
-  }
-});
+  });
 
 /**
  * @openapi
@@ -344,97 +350,99 @@ router.get("/vc/:credentialId", async (req: Request, res: Response) => {
  *               reason: { type: string }
  */
 // POST /issuer/vc/revoke (standalone-safe)
-router.post("/vc/revoke", async (req, res) => {
-  const { credentialId, reason } = req.body;
-  if (!credentialId) return res.status(400).json({ error: "credentialId required" });
+router.post("/vc/revoke",
+  requireRoleActive("issuer"),
+  async (req, res) => {
+    const { credentialId, reason } = req.body;
+    if (!credentialId) return res.status(400).json({ error: "credentialId required" });
 
-  const issuerDid = mustGetDid(req);
+    const issuerDid = mustGetDid(req);
 
-  try {
-    const cred = await Credential.findOne({ credentialId, issuerDid }).lean();
-    if (!cred) return res.status(404).json({ error: "not found" });
+    try {
+      const cred = await Credential.findOne({ credentialId, issuerDid }).lean();
+      if (!cred) return res.status(404).json({ error: "not found" });
 
-    // 1) Revoke off-chain VC
-    const updated = await Credential.findOneAndUpdate(
-      { credentialId, issuerDid },
-      {
-        $set: {
-          status: "revoked",
-          revokedAt: new Date(),
-          revokeReason: reason || "unspecified",
-        },
-      },
-      { new: true }
-    ).lean();
-
-    // 2) If this is a recruiter trust VC, also revoke on-chain + update Recruiter.badge
-    const isRecruiterVc =
-      Array.isArray(cred.type) && cred.type.includes("RecruiterCredential");
-
-    let badgeRevocation: any = null;
-
-    if (isRecruiterVc) {
-      // find recruiter by DID = subjectDid
-      const recruiter = await Recruiter.findOne({ did: cred.subjectDid });
-
-      if (recruiter) {
-        // revoke on-chain
-        const tx = await revokeRecruiterBadgeOnChain(recruiter.did);
-
-        // update recruiter badge
-        await Recruiter.updateOne(
-          { _id: recruiter._id },
-          {
-            $set: {
-              "badge.verified": false,
-              "badge.status": "Revoked",
-              "badge.lastCheckedAt": new Date(),
-              "badge.revokedAt": new Date(),
-              "badge.revokeReason": reason || "unspecified",
-              "badge.revocationTxHash": tx.txHash,
-              "badge.network": tx.network,
-            },
-          }
-        );
-
-        // optional: also store revocation tx on credential
-        await Credential.updateOne(
-          { credentialId, issuerDid },
-          { $set: { revocationTxHash: tx.txHash } }
-        );
-
-        badgeRevocation = tx;
-      }
-    } else {
-      // Non-recruiter VC cleanup (job seeker flow)
-      await Seeker.updateOne(
-        { did: cred.subjectDid },
+      // 1) Revoke off-chain VC
+      const updated = await Credential.findOneAndUpdate(
+        { credentialId, issuerDid },
         {
-          $set: { "vcs.$[v].status": "revoked" },
-          $pull: { defaultSharedVcIds: credentialId },
+          $set: {
+            status: "revoked",
+            revokedAt: new Date(),
+            revokeReason: reason || "unspecified",
+          },
         },
-        { arrayFilters: [{ "v.credentialId": credentialId }] }
-      );
+        { new: true }
+      ).lean();
 
-      await Application.updateMany(
-        { sharedVcIds: credentialId },
-        { $pull: { sharedVcIds: credentialId } }
-      );
+      // 2) If this is a recruiter trust VC, also revoke on-chain + update Recruiter.badge
+      const isRecruiterVc =
+        Array.isArray(cred.type) && cred.type.includes("RecruiterCredential");
 
-      await SharedProof.deleteMany({ vcId: credentialId });
+      let badgeRevocation: any = null;
+
+      if (isRecruiterVc) {
+        // find recruiter by DID = subjectDid
+        const recruiter = await Recruiter.findOne({ did: cred.subjectDid });
+
+        if (recruiter) {
+          // revoke on-chain
+          const tx = await revokeRecruiterBadgeOnChain(recruiter.did);
+
+          // update recruiter badge
+          await Recruiter.updateOne(
+            { _id: recruiter._id },
+            {
+              $set: {
+                "badge.verified": false,
+                "badge.status": "Revoked",
+                "badge.lastCheckedAt": new Date(),
+                "badge.revokedAt": new Date(),
+                "badge.revokeReason": reason || "unspecified",
+                "badge.revocationTxHash": tx.txHash,
+                "badge.network": tx.network,
+              },
+            }
+          );
+
+          // optional: also store revocation tx on credential
+          await Credential.updateOne(
+            { credentialId, issuerDid },
+            { $set: { revocationTxHash: tx.txHash } }
+          );
+
+          badgeRevocation = tx;
+        }
+      } else {
+        // Non-recruiter VC cleanup (job seeker flow)
+        await Seeker.updateOne(
+          { did: cred.subjectDid },
+          {
+            $set: { "vcs.$[v].status": "revoked" },
+            $pull: { defaultSharedVcIds: credentialId },
+          },
+          { arrayFilters: [{ "v.credentialId": credentialId }] }
+        );
+
+        await Application.updateMany(
+          { sharedVcIds: credentialId },
+          { $pull: { sharedVcIds: credentialId } }
+        );
+
+        await SharedProof.deleteMany({ vcId: credentialId });
+      }
+
+      return res.json({
+        revoked: true,
+        reason: reason || "unspecified",
+        meta: updated,
+        badgeRevocation, // null for normal VCs
+      });
+    } catch (err) {
+      console.error("POST /issuer/vc/revoke error:", err);
+      return res.status(500).json({ error: "Failed to revoke VC" });
     }
-
-    return res.json({
-      revoked: true,
-      reason: reason || "unspecified",
-      meta: updated,
-      badgeRevocation, // null for normal VCs
-    });
-  } catch (err) {
-    console.error("POST /issuer/vc/revoke error:", err);
-    return res.status(500).json({ error: "Failed to revoke VC" });
-  }
-});
+  });
 
 /**
  * @openapi
@@ -449,39 +457,41 @@ router.post("/vc/revoke", async (req, res) => {
  *           type: string
  *         description: Filter by issuer DID (e.g., did:ethr:0xEMPLOYER_ISSUER_ABC)
  */
-router.get("/requests", async (req, res) => {
-  try {
-    const issuerDid = mustGetDid(req);
+router.get("/requests",
+  requireRoleActive("issuer"),
+  async (req, res) => {
+    try {
+      const issuerDid = mustGetDid(req);
 
-    const seekers = await Seeker.find({
-      pendingVcRequests: { $exists: true, $ne: [] },
-    }).lean();
+      const seekers = await Seeker.find({
+        pendingVcRequests: { $exists: true, $ne: [] },
+      }).lean();
 
-    const allRequests: any[] = [];
-    for (const seeker of seekers) {
-      for (const r of seeker.pendingVcRequests || []) {
-        if (r.issuerDid !== issuerDid) continue;
+      const allRequests: any[] = [];
+      for (const seeker of seekers) {
+        for (const r of seeker.pendingVcRequests || []) {
+          if (r.issuerDid !== issuerDid) continue;
 
-        allRequests.push({
-          requestId: r.id,
-          section: r.section,
-          title: r.title,
-          issuerDid: r.issuerDid,
-          status: r.status ?? "pending",
-          requestedAt: r.requestedAt,
-          seekerId: seeker._id.toString(),
-          seekerDid: seeker.did,
-          seekerEmail: seeker.email,
-        });
+          allRequests.push({
+            requestId: r.id,
+            section: r.section,
+            title: r.title,
+            issuerDid: r.issuerDid,
+            status: r.status ?? "pending",
+            requestedAt: r.requestedAt,
+            seekerId: seeker._id.toString(),
+            seekerDid: seeker.did,
+            seekerEmail: seeker.email,
+          });
+        }
       }
-    }
 
-    return res.json({ items: allRequests });
-  } catch (err) {
-    console.error("GET /issuer/requests error:", err);
-    return res.status(500).json({ error: "Failed to list VC requests" });
-  }
-});
+      return res.json({ items: allRequests });
+    } catch (err) {
+      console.error("GET /issuer/requests error:", err);
+      return res.status(500).json({ error: "Failed to list VC requests" });
+    }
+  });
 
 /**
  * @openapi
@@ -512,6 +522,7 @@ router.get("/requests", async (req, res) => {
  */
 router.post(
   "/requests/:requestId/approve",
+  requireRoleActive("issuer"),
   async (req: Request, res: Response) => {
     try {
       const { requestId } = req.params;
@@ -656,59 +667,61 @@ router.post(
  *             properties:
  *               reason: { type: string }
  */
-router.post("/requests/:requestId/reject", async (req, res) => {
-  try {
-    const { requestId } = req.params;
-    const { reason } = req.body || {};
-    const issuerDid = mustGetDid(req);
+router.post("/requests/:requestId/reject",
+  requireRoleActive("issuer"),
+  async (req, res) => {
+    try {
+      const { requestId } = req.params;
+      const { reason } = req.body || {};
+      const issuerDid = mustGetDid(req);
 
-    const seeker = await Seeker.findOne({
-      "pendingVcRequests.id": requestId,
-    });
+      const seeker = await Seeker.findOne({
+        "pendingVcRequests.id": requestId,
+      });
 
-    if (!seeker) {
-      return res.status(404).json({ error: "Request not found" });
+      if (!seeker) {
+        return res.status(404).json({ error: "Request not found" });
+      }
+
+      const pendingList = seeker.pendingVcRequests || [];
+      const requestEntry = pendingList.find((r: any) => r.id === requestId);
+      if (!requestEntry) {
+        return res.status(404).json({ error: "Request not found" });
+      }
+
+      if (requestEntry.issuerDid !== issuerDid) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      requestEntry.status = "rejected";
+      requestEntry.rejectedAt = new Date().toISOString();
+      requestEntry.rejectReason = reason || "unspecified";
+
+      seeker.pendingVcRequests = pendingList.filter(
+        (r: any) => r.id !== requestId
+      );
+
+      seeker.vcs = [
+        ...(seeker.vcs ?? []),
+        {
+          id: requestEntry.id,
+          section: requestEntry.section,
+          title: requestEntry.title,
+          issuerDid: requestEntry.issuerDid,
+          status: "rejected",
+          issuedAt: requestEntry.rejectedAt,
+          credentialId: undefined,             // no actual VC JSON
+        },
+      ];
+
+      await seeker.save();
+
+      return res.json({ ok: true, request: requestEntry });
+    } catch (err) {
+      console.error("POST /issuer/requests/:requestId/reject error:", err);
+      return res.status(500).json({ error: "Failed to reject VC request" });
     }
-
-    const pendingList = seeker.pendingVcRequests || [];
-    const requestEntry = pendingList.find((r: any) => r.id === requestId);
-    if (!requestEntry) {
-      return res.status(404).json({ error: "Request not found" });
-    }
-
-    if (requestEntry.issuerDid !== issuerDid) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-
-    requestEntry.status = "rejected";
-    requestEntry.rejectedAt = new Date().toISOString();
-    requestEntry.rejectReason = reason || "unspecified";
-
-    seeker.pendingVcRequests = pendingList.filter(
-      (r: any) => r.id !== requestId
-    );
-
-    seeker.vcs = [
-      ...(seeker.vcs ?? []),
-      {
-        id: requestEntry.id,
-        section: requestEntry.section,
-        title: requestEntry.title,
-        issuerDid: requestEntry.issuerDid,
-        status: "rejected",
-        issuedAt: requestEntry.rejectedAt,
-        credentialId: undefined,             // no actual VC JSON
-      },
-    ];
-
-    await seeker.save();
-
-    return res.json({ ok: true, request: requestEntry });
-  } catch (err) {
-    console.error("POST /issuer/requests/:requestId/reject error:", err);
-    return res.status(500).json({ error: "Failed to reject VC request" });
-  }
-});
+  });
 
 /**
  * GET /issuer/recruiters/pending
@@ -716,43 +729,45 @@ router.post("/requests/:requestId/reject", async (req, res) => {
  * List recruiters whose KYC is pending.
  * Later you can filter by issuer orgName if needed.
  */
-router.get("/recruiters/pending", async (req: Request, res: Response) => {
-  try {
-    // const { issuerDid } = req.query as { issuerDid?: string };
+router.get("/recruiters/pending",
+  requireRoleActive("issuer"),
+  async (req: Request, res: Response) => {
+    try {
+      // const { issuerDid } = req.query as { issuerDid?: string };
 
-    let orgNameFilter: string | undefined;
+      let orgNameFilter: string | undefined;
 
-    const issuerDid = mustGetDid(req);
-    const issuer = await Issuer.findOne({ did: issuerDid });
-    if (issuer?.orgName) {
-      // normalize: lowercase + remove spaces 
-      orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
-    }
-
-    /*
-    if (issuerDid) {
+      const issuerDid = mustGetDid(req);
       const issuer = await Issuer.findOne({ did: issuerDid });
       if (issuer?.orgName) {
-        // normalize: lowercase + remove spaces
+        // normalize: lowercase + remove spaces 
         orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
       }
+
+      /*
+      if (issuerDid) {
+        const issuer = await Issuer.findOne({ did: issuerDid });
+        if (issuer?.orgName) {
+          // normalize: lowercase + remove spaces
+          orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
+        }
+      }
+        */
+
+      const recruitersRaw = await Recruiter.find({ kycStatus: "pending" });
+      const filtered = recruitersRaw.filter(r => {
+        if (!orgNameFilter) return true;
+
+        const legal = (r.orgLegalName ?? "").toLowerCase().replace(/\s+/g, "");
+        return legal === orgNameFilter;
+      });
+
+      return res.json({ items: filtered.map(toRecruiterApi) });
+    } catch (err) {
+      console.error("GET /issuer/recruiters/pending error:", err);
+      res.status(500).json({ error: "Failed to list pending recruiters" });
     }
-      */
-
-    const recruitersRaw = await Recruiter.find({ kycStatus: "pending" });
-    const filtered = recruitersRaw.filter(r => {
-      if (!orgNameFilter) return true;
-
-      const legal = (r.orgLegalName ?? "").toLowerCase().replace(/\s+/g, "");
-      return legal === orgNameFilter;
-    });
-
-    return res.json({ items: filtered.map(toRecruiterApi) });
-  } catch (err) {
-    console.error("GET /issuer/recruiters/pending error:", err);
-    res.status(500).json({ error: "Failed to list pending recruiters" });
-  }
-});
+  });
 
 /**
  * GET /issuer/recruiters/badges
@@ -761,46 +776,48 @@ router.get("/recruiters/pending", async (req: Request, res: Response) => {
  * - kycStatus "pending" (awaiting decision)
  * - or "approved" with an active badge
  */
-router.get("/recruiters/badges", async (req: Request, res: Response) => {
-  try {
-    //const { issuerDid } = req.query as { issuerDid?: string };
+router.get("/recruiters/badges",
+  requireRoleActive("issuer"),
+  async (req: Request, res: Response) => {
+    try {
+      //const { issuerDid } = req.query as { issuerDid?: string };
 
-    let orgNameFilter: string | undefined;
+      let orgNameFilter: string | undefined;
 
-    const issuerDid = mustGetDid(req);
-    const issuer = await Issuer.findOne({ did: issuerDid });
-    if (issuer?.orgName) {
-      orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
-    }
-
-    /*
-    if (issuerDid) {
+      const issuerDid = mustGetDid(req);
       const issuer = await Issuer.findOne({ did: issuerDid });
       if (issuer?.orgName) {
         orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
       }
+
+      /*
+      if (issuerDid) {
+        const issuer = await Issuer.findOne({ did: issuerDid });
+        if (issuer?.orgName) {
+          orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
+        }
+      }
+      */
+
+      const recruitersRaw = await Recruiter.find({
+        kycStatus: { $in: ["rejected", "approved"] }
+      }).sort({ updatedAt: -1 });
+
+      const filtered = recruitersRaw.filter(r => {
+        if (!orgNameFilter) return true;
+
+        const legal = (r.orgLegalName ?? "").toLowerCase().replace(/\s+/g, "");
+        return legal === orgNameFilter;
+      });
+
+      return res.json({ items: filtered.map(toRecruiterApi) });
+    } catch (err) {
+      console.error("GET /issuer/recruiters/badges error:", err);
+      return res
+        .status(500)
+        .json({ error: "Failed to list recruiter trust badges" });
     }
-    */
-
-    const recruitersRaw = await Recruiter.find({
-      kycStatus: { $in: ["rejected", "approved"] }
-    }).sort({ updatedAt: -1 });
-
-    const filtered = recruitersRaw.filter(r => {
-      if (!orgNameFilter) return true;
-
-      const legal = (r.orgLegalName ?? "").toLowerCase().replace(/\s+/g, "");
-      return legal === orgNameFilter;
-    });
-
-    return res.json({ items: filtered.map(toRecruiterApi) });
-  } catch (err) {
-    console.error("GET /issuer/recruiters/badges error:", err);
-    return res
-      .status(500)
-      .json({ error: "Failed to list recruiter trust badges" });
-  }
-});
+  });
 
 /**
  * POST /issuer/recruiters/:id/approve
@@ -808,112 +825,116 @@ router.get("/recruiters/badges", async (req: Request, res: Response) => {
  */
 // PATCH: /issuer/recruiters/:id/approve
 
-router.post("/recruiters/:id/approve", async (req: Request, res: Response) => {
-  try {
-    const recruiterId = req.params.id;
+router.post("/recruiters/:id/approve",
+  requireRoleActive("issuer"),
+  async (req: Request, res: Response) => {
+    try {
+      const recruiterId = req.params.id;
 
-    // Whoever hits this endpoint is the issuer → get DID from DB
-    //const issuer = await Issuer.findOne({ did: req.body.issuerDid });
-    const issuerDid = mustGetDid(req);
-    const issuer = await Issuer.findOne({ did: issuerDid });
-    if (!issuer) {
-      return res.status(400).json({ error: "Issuer not found" });
-    }
-
-    const recruiter = await Recruiter.findById(recruiterId);
-
-    if (!recruiter) {
-      return res.status(404).json({ error: "Recruiter not found" });
-    }
-
-    const subjectDid = recruiter.did;             // ✔ recruiter DID
-
-    // 1) Issue the on-chain trust badge
-    const badge = await issueRecruiterBadgeOnChain(subjectDid, 1);
-
-    // 2) Issue a real Verifiable Credential
-    const { vcId, vc } = await issueSimpleVc({
-      subjectDid,
-      issuerDid,
-      section: "recruiter",
-      credentialType: "RecruiterCredential",
-      title: `Recruiter Verification for ${recruiter.orgLegalName ?? "Unknown Org"}`,
-      claims: {
-        section: "recruiter",
-        orgName: recruiter.orgLegalName,
-        contactEmail: recruiter.contactEmail,
-        website: recruiter.website
+      // Whoever hits this endpoint is the issuer → get DID from DB
+      //const issuer = await Issuer.findOne({ did: req.body.issuerDid });
+      const issuerDid = mustGetDid(req);
+      const issuer = await Issuer.findOne({ did: issuerDid });
+      if (!issuer) {
+        return res.status(400).json({ error: "Issuer not found" });
       }
-    });
 
-    // 3) Create Credential document
-    await Credential.create({
-      credentialId: vcId,
-      subjectDid,
-      issuerDid,
-      title: `Recruiter Verification for ${recruiter.orgLegalName}`,
-      type: vc.type,
-      issuanceDate: new Date(vc.issuanceDate),
-      status: "active",
-      vcRaw: vc,
-      onChainTxHash: badge.txHash,
-      network: badge.network,
-    });
+      const recruiter = await Recruiter.findById(recruiterId);
 
-    // 4) Update recruiter badge meta
-    recruiter.kycStatus = "approved";
-    recruiter.badge = {
-      verified: true,
-      status: "Active",
-      level: 1,
-      lastCheckedAt: new Date(),
-      txHash: badge.txHash,
-      network: badge.network,
-      credentialId: vcId,       // ⭐ NEW FIELD you MUST add in recruiter schema
-    };
+      if (!recruiter) {
+        return res.status(404).json({ error: "Recruiter not found" });
+      }
 
-    await recruiter.save();
+      const subjectDid = recruiter.did;             // ✔ recruiter DID
 
-    res.json({
-      ok: true,
-      message: "Recruiter approved, trust badge issued, VC created",
-      credentialId: vcId,
-      txHash: badge.txHash
-    });
+      // 1) Issue the on-chain trust badge
+      const badge = await issueRecruiterBadgeOnChain(subjectDid, 1);
 
-  } catch (err) {
-    console.error("approve recruiter error:", err);
-    res.status(500).json({ error: "Failed to approve recruiter" });
-  }
-});
+      // 2) Issue a real Verifiable Credential
+      const { vcId, vc } = await issueSimpleVc({
+        subjectDid,
+        issuerDid,
+        section: "recruiter",
+        credentialType: "RecruiterCredential",
+        title: `Recruiter Verification for ${recruiter.orgLegalName ?? "Unknown Org"}`,
+        claims: {
+          section: "recruiter",
+          orgName: recruiter.orgLegalName,
+          contactEmail: recruiter.contactEmail,
+          website: recruiter.website
+        }
+      });
+
+      // 3) Create Credential document
+      await Credential.create({
+        credentialId: vcId,
+        subjectDid,
+        issuerDid,
+        title: `Recruiter Verification for ${recruiter.orgLegalName}`,
+        type: vc.type,
+        issuanceDate: new Date(vc.issuanceDate),
+        status: "active",
+        vcRaw: vc,
+        onChainTxHash: badge.txHash,
+        network: badge.network,
+      });
+
+      // 4) Update recruiter badge meta
+      recruiter.kycStatus = "approved";
+      recruiter.badge = {
+        verified: true,
+        status: "Active",
+        level: 1,
+        lastCheckedAt: new Date(),
+        txHash: badge.txHash,
+        network: badge.network,
+        credentialId: vcId,       // ⭐ NEW FIELD you MUST add in recruiter schema
+      };
+
+      await recruiter.save();
+
+      res.json({
+        ok: true,
+        message: "Recruiter approved, trust badge issued, VC created",
+        credentialId: vcId,
+        txHash: badge.txHash
+      });
+
+    } catch (err) {
+      console.error("approve recruiter error:", err);
+      res.status(500).json({ error: "Failed to approve recruiter" });
+    }
+  });
 
 
 /**
  * POST /issuer/recruiters/:id/reject
  * Body: { reason?: string }
  */
-router.post("/recruiters/:id/reject", async (req: Request, res: Response) => {
-  try {
-    const recruiter = await Recruiter.findById(req.params.id);
-    if (!recruiter) {
-      return res.status(404).json({ error: "Recruiter not found" });
+router.post("/recruiters/:id/reject",
+  requireRoleActive("issuer"),
+  async (req: Request, res: Response) => {
+    try {
+      const recruiter = await Recruiter.findById(req.params.id);
+      if (!recruiter) {
+        return res.status(404).json({ error: "Recruiter not found" });
+      }
+
+      recruiter.kycStatus = "rejected";
+      recruiter.badge = {
+        ...(recruiter.badge || {}),
+        verified: false,
+        status: "Rejected",
+        lastCheckedAt: new Date(),
+      };
+      await recruiter.save();
+
+      return res.json(toRecruiterApi(recruiter));
+    } catch (err) {
+      console.error("reject recruiter error", err);
+      return res.status(500).json({ error: "Failed to reject recruiter" });
     }
-
-    recruiter.kycStatus = "rejected";
-    recruiter.badge = {
-      ...(recruiter.badge || {}),
-      verified: false,
-      status: "Rejected",
-      lastCheckedAt: new Date(),
-    };
-    await recruiter.save();
-
-    return res.json(toRecruiterApi(recruiter));
-  } catch (err) {
-    console.error("reject recruiter error", err);
-    return res.status(500).json({ error: "Failed to reject recruiter" });
-  }
-});
+  });
 
 /**
  * GET /issuer/me
@@ -923,34 +944,36 @@ router.post("/recruiters/:id/reject", async (req: Request, res: Response) => {
  * - Backend is responsible for canonical issuer.did (did:key from DIDKit).
  * - We normalise / migrate by calling ensureBbsKeyForIssuer if needed.
  */
-router.get("/me", async (req, res) => {
-  try {
-    const s = mustGetSession(req);
-    const did = s.did?.trim();
-    const email = s.email?.trim().toLowerCase();
+router.get("/me",
+  requireRoleStateIn("issuer", ["none", "active"]),
+  async (req, res) => {
+    try {
+      const s = mustGetSession(req);
+      const did = s.did?.trim();
+      const email = s.email?.trim().toLowerCase();
 
-    const issuerDoc0 =
-      (did && (await Issuer.findOne({ did }))) ||
-      (email && (await Issuer.findOne({ email })));
+      const issuerDoc0 =
+        (did && (await Issuer.findOne({ did }))) ||
+        (email && (await Issuer.findOne({ email })));
 
-    if (!issuerDoc0) return res.status(404).json({ error: "Issuer not found" });
+      if (!issuerDoc0) return res.status(404).json({ error: "Issuer not found" });
 
-    const issuerDoc = await ensureBbsKeyForIssuer(issuerDoc0);
+      const issuerDoc = await ensureBbsKeyForIssuer(issuerDoc0);
 
-    return res.json({
-      id: issuerDoc._id.toString(),
-      did: issuerDoc.did,
-      email: issuerDoc.email,
-      name: issuerDoc.name,
-      orgName: issuerDoc.orgName,
-      orgType: issuerDoc.orgType,
-      onboarded: issuerDoc.onboarded ?? false,
-      hasBbsKey: Boolean(issuerDoc.bbsVerificationMethodId),
-    });
-  } catch (e) {
-    return res.status(401).json({ error: "Unauthenticated" });
-  }
-});
+      return res.json({
+        id: issuerDoc._id.toString(),
+        did: issuerDoc.did,
+        email: issuerDoc.email,
+        name: issuerDoc.name,
+        orgName: issuerDoc.orgName,
+        orgType: issuerDoc.orgType,
+        onboarded: issuerDoc.onboarded ?? false,
+        hasBbsKey: Boolean(issuerDoc.bbsVerificationMethodId),
+      });
+    } catch (e) {
+      return res.status(401).json({ error: "Unauthenticated" });
+    }
+  });
 
 /**
  * POST /issuer/onboard
@@ -963,92 +986,82 @@ router.get("/me", async (req, res) => {
  *     - otherwise generate a stable fallback DID from the email
  * - BBS keys are managed via ensureBbsKeyForIssuer().
  */
-router.post("/onboard", async (req, res) => {
-  try {
-    /*
-    const {
-      email,
-      did,
-      name,
-      orgName,
-      orgType,
-      onboarded,
-    } = req.body as {
-      email?: string;
-      did?: string;
-      name?: string;
-      orgName?: string;
-      orgType?: "company" | "university" | "certBody";
-      onboarded?: boolean;
-    };
-    */
+router.post("/onboard",
+  requireRoleStateIn("issuer", ["none", "active"]),
+  async (req, res) => {
+    try {
+      const s = mustGetSession(req);
+      const email = s.email;
+      const did = s.did;
+      const { name, orgName, orgType, onboarded } = req.body;
 
-    const s = mustGetSession(req);
-    const email = s.email;
-    const did = s.did;
-    const { name, orgName, orgType, onboarded } = req.body;
-
-    if (!email) {
-      return res
-        .status(400)
-        .json({ error: "email is required to onboard issuer" });
-    }
-
-    const normalizedEmail = String(email).toLowerCase();
-
-    // Find by email only – this is our stable login identifier.
-    let issuerDoc = await Issuer.findOne({ email: normalizedEmail });
-
-    if (!issuerDoc) {
-      // New issuer – we either use the provided DID or generate one.
-      const baseDid =
-        (did && did.trim()) ||
-        `did:web:securehire:${normalizedEmail.replace(/[^a-z0-9]/gi, "-")}`;
-
-      issuerDoc = new Issuer({
-        email: normalizedEmail,
-        did: baseDid,
-      } as Partial<IIssuer>);
-    } else {
-      // Existing issuer: if DID is missing and frontend supplies one, set it once.
-      if (!issuerDoc.did && did && did.trim()) {
-        issuerDoc.did = did.trim();
+      if (!email) {
+        return res
+          .status(400)
+          .json({ error: "email is required to onboard issuer" });
       }
-    }
 
-    // Update basic profile fields
-    if (typeof name === "string" && name.trim()) {
-      issuerDoc.name = name.trim();
-    }
-    if (typeof orgName === "string" && orgName.trim()) {
-      issuerDoc.orgName = orgName.trim();
-    }
-    if (orgType === "company" || orgType === "university" || orgType === "certBody") {
-      issuerDoc.orgType = orgType;
-    }
-    if (typeof onboarded === "boolean") {
-      issuerDoc.onboarded = onboarded;
-    }
+      const normalizedEmail = String(email).toLowerCase();
 
-    // 🔐 Ensure this issuer has a BBS+ keypair (BLS12-381 G2) for VC signing.
-    const issuerWithKey = await ensureBbsKeyForIssuer(issuerDoc as any);
+      // Find by email only – this is our stable login identifier.
+      let issuerDoc = await Issuer.findOne({ email: normalizedEmail });
 
-    await issuerWithKey.save();
+      if (!issuerDoc) {
+        // New issuer – we either use the provided DID or generate one.
+        const baseDid =
+          (did && did.trim()) ||
+          `did:web:securehire:${normalizedEmail.replace(/[^a-z0-9]/gi, "-")}`;
 
-    return res.status(201).json({
-      id: issuerWithKey._id.toString(),
-      did: issuerWithKey.did,
-      email: issuerWithKey.email,
-      name: issuerWithKey.name,
-      orgName: issuerWithKey.orgName,
-      orgType: issuerWithKey.orgType,
-      onboarded: issuerWithKey.onboarded ?? false,
-      hasBbsKey: Boolean(issuerWithKey.bbsVerificationMethodId),
-    });
-  } catch (err) {
-    console.error("POST /issuer/onboard error:", err);
-    return res.status(500).json({ error: "Failed to onboard issuer" });
-  }
-});
+        issuerDoc = new Issuer({
+          email: normalizedEmail,
+          did: baseDid,
+        } as Partial<IIssuer>);
+      } else {
+        // Existing issuer: if DID is missing and frontend supplies one, set it once.
+        if (!issuerDoc.did && did && did.trim()) {
+          issuerDoc.did = did.trim();
+        }
+      }
+
+      // Update basic profile fields
+      if (typeof name === "string" && name.trim()) {
+        issuerDoc.name = name.trim();
+      }
+      if (typeof orgName === "string" && orgName.trim()) {
+        issuerDoc.orgName = orgName.trim();
+      }
+      if (orgType === "company" || orgType === "university" || orgType === "certBody") {
+        issuerDoc.orgType = orgType;
+      }
+      if (typeof onboarded === "boolean") {
+        issuerDoc.onboarded = onboarded;
+      }
+
+      // 🔐 Ensure this issuer has a BBS+ keypair (BLS12-381 G2) for VC signing.
+      const issuerWithKey = await ensureBbsKeyForIssuer(issuerDoc as any);
+
+      await issuerWithKey.save();
+
+      if (req.user) {
+        req.user.roles.issuer = issuerWithKey.onboarded ? "active" : "none";
+        await req.user.save();
+      }
+
+      return res.status(201).json({
+        id: issuerWithKey._id.toString(),
+        did: issuerWithKey.did,
+        email: issuerWithKey.email,
+        name: issuerWithKey.name,
+        orgName: issuerWithKey.orgName,
+        orgType: issuerWithKey.orgType,
+        onboarded: issuerWithKey.onboarded ?? false,
+        hasBbsKey: Boolean(issuerWithKey.bbsVerificationMethodId),
+      });
+
+    } catch (err) {
+      console.error("POST /issuer/onboard error:", err);
+      return res.status(500).json({ error: "Failed to onboard issuer" });
+    }
+  });
 
 export default router;

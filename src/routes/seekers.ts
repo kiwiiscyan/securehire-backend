@@ -5,7 +5,12 @@ import Issuer from "../models/Issuer";
 import mongoose from "mongoose";
 import Credential from "../models/Credential";
 import { registerDidOnChain } from "../services/did-registry.service";
-import { requireSession, getSession } from "../middleware/requireSession";
+import { requireSession } from "../middleware/requireSession";
+import { requireUser } from "../middleware/requireUser";
+import { requireRoleStateIn, requireRoleActive } from "../middleware/rbac";
+import { syncSeekerRoleFromSeekerDoc } from "../middleware/syncSeekerRoleFromSeekerDoc";
+import { requireSeekerOnboarded } from "../middleware/requireSeekerOnboarded";
+import { mustGetIdentity, deriveDidFromSession, findSeekerBySession } from "../services/seekerIdentity";
 import crypto from "crypto";
 
 const router = Router();
@@ -14,35 +19,11 @@ const router = Router();
  * All seeker routes require an authenticated session.
  * Identity (did/email) is taken from the verified session, NOT client body/query.
  */
-router.use(requireSession);
+router.use(requireSession, requireUser, syncSeekerRoleFromSeekerDoc);
 
 // Simple normaliser: lowercase + trim
 const norm = (s?: string | null) =>
   (s || "").trim().toLowerCase();
-
-type SessionPayload = {
-  did?: string;
-  email?: string;
-  wallet_address?: string;
-};
-
-/**
- * Prefer DID, fallback email. Throw if neither exists.
- */
-function mustGetIdentity(req: Request): { did?: string; email?: string; wallet_address?: string } {
-  const s = (getSession(req) || {}) as SessionPayload;
-
-  const did = s.did?.trim();
-  const email = s.email?.trim().toLowerCase();
-  const wallet_address = s.wallet_address?.trim();
-
-  if (!did && !email) {
-    // Should not happen if requireSession is correct, but keep it defensive.
-    throw new Error("Missing session identity (did/email)");
-  }
-  return { did, email, wallet_address };
-}
-
 /**
  * Optional: validate a client-proposed DID (e.g. did:pkh...) against session wallet.
  * This lets you keep your current frontend flow (client builds did:pkh) while NOT trusting it blindly.
@@ -71,53 +52,6 @@ function validateDidAgainstSessionWallet(clientDid: string, session: { wallet_ad
   }
 
   return false;
-}
-
-/**
- * Decide which DID we should store on the seeker record.
- * Preference:
- *  1) if session.did is did:pkh -> use it
- *  2) else if session.wallet_address exists -> construct did:pkh:eip155:80002:<addr>
- *  3) else -> use session.did (e.g. did:privy:...)
- */
-function deriveDidFromSession(session: SessionPayload): string | undefined {
-  const sDid = session.did?.trim();
-  const w = session.wallet_address?.trim();
-
-  if (sDid && sDid.startsWith("did:pkh:")) return sDid;
-  if (w && /^0x[a-fA-F0-9]{40}$/.test(w)) {
-    return `did:pkh:eip155:80002:${w.toLowerCase()}`;
-  }
-  if (sDid) return sDid;
-  return undefined;
-}
-
-/**
- * Resolve current seeker doc based on session identity
- */
-async function findSeekerBySession(req: Request) {
-  const s = mustGetIdentity(req);
-
-  // 1) direct did match
-  if (s.did) {
-    const byDid = await Seeker.findOne({ did: s.did });
-    if (byDid) return byDid;
-  }
-
-  // 2) if session has wallet, try did:pkh derived
-  if (s.wallet_address && /^0x[a-fA-F0-9]{40}$/.test(s.wallet_address)) {
-    const didPkh = `did:pkh:eip155:80002:${s.wallet_address.toLowerCase()}`;
-    const byDerived = await Seeker.findOne({ did: didPkh });
-    if (byDerived) return byDerived;
-  }
-
-  // 3) email fallback
-  if (s.email) {
-    const byEmail = await Seeker.findOne({ email: s.email });
-    if (byEmail) return byEmail;
-  }
-
-  return null;
 }
 
 /**
@@ -234,117 +168,158 @@ function toSeekerDTO(doc: ISeeker | any) {
  *       200:
  *         description: Upserted seeker
  */
-router.post("/onboard", async (req, res) => {
-  try {
-    const session = mustGetIdentity(req);
+router.post("/onboard",
+  requireRoleStateIn("seeker", ["none", "active"]),
+  async (req, res) => {
+    try {
+      const session = mustGetIdentity(req);
 
-    const {
-      name,
-      homeLocation,
-      classification,
-      subClass,
-      visibility,
-      vcOnly,
-      consentShareVC,
-      antiPhishAck,
-      careerSeed,
-      onboarded,
-      // optional legacy fields (ignored for identity)
-      //did: clientDid,
-    } = req.body || {};
+      const {
+        name,
+        homeLocation,
+        classification,
+        subClass,
+        visibility,
+        vcOnly,
+        consentShareVC,
+        antiPhishAck,
+        careerSeed,
+        onboarded,
+        // optional legacy fields (ignored for identity)
+        //did: clientDid,
+      } = req.body || {};
 
-    // Name is still required for onboarding updates
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ error: "name is required" });
-    }
-
-    // Find by session
-    let doc = await findSeekerBySession(req);
-
-    // Create if not exists
-    if (!doc) {
-      doc = new Seeker({
-        email: session.email, // from session
-        name: String(name).trim(),
-        onboarded: !!onboarded,
-      });
-    }
-
-    // Ensure email is set from session (authoritative)
-    if (session.email && !doc.email) doc.email = session.email;
-
-    // Decide DID to store:
-    // - If client provides a did, we ONLY accept it if it matches session wallet/session did
-    // - Otherwise we derive from session
-    const derived = deriveDidFromSession(session);
-    let didToStore: string | undefined = derived;
-
-    /*
-    if (clientDid && validateDidAgainstSessionWallet(String(clientDid), session)) {
-      didToStore = String(clientDid).trim();
-    }
-      */
-
-    // Assign DID only if empty
-    if (didToStore && !doc.did) {
-      doc.did = didToStore;
-
-      // Optional: register DID on-chain (best-effort)
-      try {
-        const addressMatch = didToStore.match(/0x[a-fA-F0-9]{40}/);
-        if (addressMatch && process.env.DID_REGISTRY_ADDRESS) {
-          const walletAddress = addressMatch[0];
-          const didDocHash = crypto.createHash("sha256").update(didToStore).digest("hex");
-          const txHash = await registerDidOnChain(walletAddress, didToStore, `0x${didDocHash}`);
-          console.log(`[seekers/onboard] DID registered on blockchain: ${didToStore}, tx: ${txHash}`);
-          (doc as any).didRegistrationTxHash = txHash;
-        }
-      } catch (blockchainErr: any) {
-        console.error(
-          "[seekers/onboard] Failed to register DID on blockchain:",
-          blockchainErr?.message || blockchainErr
-        );
+      // Name is still required for onboarding updates
+      if (!name || !String(name).trim()) {
+        return res.status(400).json({ error: "name is required" });
       }
+
+      // Find by session
+      let doc = await findSeekerBySession(req);
+
+      // Create if not exists
+      if (!doc) {
+        doc = new Seeker({
+          email: session.email, // from session
+          name: String(name).trim(),
+          onboarded: !!onboarded,
+        });
+      }
+
+      // Ensure email is set from session (authoritative)
+      if (session.email && !doc.email) doc.email = session.email;
+
+      // Decide DID to store:
+      // - If client provides a did, we ONLY accept it if it matches session wallet/session did
+      // - Otherwise we derive from session
+      const derived = deriveDidFromSession(session);
+      let didToStore: string | undefined = derived;
+
+      /*
+      if (clientDid && validateDidAgainstSessionWallet(String(clientDid), session)) {
+        didToStore = String(clientDid).trim();
+      }
+        */
+
+      // Assign DID only if empty
+      if (didToStore && !doc.did) {
+        doc.did = didToStore;
+
+        // Optional: register DID on-chain (best-effort)
+        try {
+          const addressMatch = didToStore.match(/0x[a-fA-F0-9]{40}/);
+          if (addressMatch && process.env.DID_REGISTRY_ADDRESS) {
+            const walletAddress = addressMatch[0];
+            const didDocHash = crypto.createHash("sha256").update(didToStore).digest("hex");
+            const txHash = await registerDidOnChain(walletAddress, didToStore, `0x${didDocHash}`);
+            console.log(`[seekers/onboard] DID registered on blockchain: ${didToStore}, tx: ${txHash}`);
+            (doc as any).didRegistrationTxHash = txHash;
+          }
+        } catch (blockchainErr: any) {
+          console.error(
+            "[seekers/onboard] Failed to register DID on blockchain:",
+            blockchainErr?.message || blockchainErr
+          );
+        }
+      }
+
+      // Update profile fields (non-identity)
+      doc.name = String(name).trim();
+
+      if (typeof onboarded === "boolean") {
+        doc.onboarded = doc.onboarded || onboarded;
+      }
+
+      doc.homeLocation = homeLocation;
+      doc.classification = classification;
+      doc.subClass = subClass;
+      doc.visibility = visibility;
+      doc.vcOnly = vcOnly;
+      doc.consentShareVC = consentShareVC;
+      doc.antiPhishAck = antiPhishAck;
+
+      if (careerSeed?.title || careerSeed?.company) {
+        doc.profile = { careerHistory: [careerSeed] };
+      }
+
+      await doc.save();
+
+      if (req.user) {
+        req.user.roles.seeker = doc.onboarded ? "active" : "none";
+        await req.user.save();
+      }
+
+      return res.json(toSeekerDTO(doc));
+    } catch (err: any) {
+      console.error("POST /seekers/onboard error:", err);
+
+      if (err?.code === 11000 && err?.keyPattern?.did) {
+        return res.status(409).json({
+          error: "DID already exists. Please regenerate a new DID.",
+        });
+      }
+
+      // If our identity helper threw:
+      if (String(err?.message || "").includes("Missing session identity")) {
+        return res.status(401).json({ error: "Unauthenticated" });
+      }
+
+      return res.status(500).json({ error: "Failed to onboard seeker" });
     }
+  });
 
-    // Update profile fields (non-identity)
-    doc.name = String(name).trim();
-
-    if (typeof onboarded === "boolean") {
-      doc.onboarded = doc.onboarded || onboarded;
-    }
-
-    doc.homeLocation = homeLocation;
-    doc.classification = classification;
-    doc.subClass = subClass;
-    doc.visibility = visibility;
-    doc.vcOnly = vcOnly;
-    doc.consentShareVC = consentShareVC;
-    doc.antiPhishAck = antiPhishAck;
-
-    if (careerSeed?.title || careerSeed?.company) {
-      doc.profile = { careerHistory: [careerSeed] };
-    }
-
-    await doc.save();
+/**
+ * @openapi
+ * /seekers/me:
+ *   get:
+ *     summary: Get seeker (session-only)
+ *     tags: [Seekers]
+ *     parameters:
+ *       - in: query
+ *         name: did
+ *         schema: { type: string }
+ *       - in: query
+ *         name: email
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Seeker found
+ *       404:
+ *         description: Seeker not found
+ */
+router.get("/me", async (req: Request, res: Response) => {
+  try {
+    const doc = await findSeekerBySession(req);
+    if (!doc) return res.status(404).json({ error: "Seeker not found" });
     return res.json(toSeekerDTO(doc));
-  } catch (err: any) {
-    console.error("POST /seekers/onboard error:", err);
-
-    if (err?.code === 11000 && err?.keyPattern?.did) {
-      return res.status(409).json({
-        error: "DID already exists. Please regenerate a new DID.",
-      });
-    }
-
-    // If our identity helper threw:
-    if (String(err?.message || "").includes("Missing session identity")) {
-      return res.status(401).json({ error: "Unauthenticated" });
-    }
-
-    return res.status(500).json({ error: "Failed to onboard seeker" });
+  } catch (err) {
+    console.error("GET /seekers/me error:", err);
+    return res.status(500).json({ error: "Failed to fetch seeker" });
   }
 });
+
+router.use(requireSeekerOnboarded);
+router.use(requireRoleActive("seeker"));
 
 /**
  * @openapi
@@ -731,36 +706,6 @@ router.patch("/vcs/share-default", async (req, res) => {
   } catch (err) {
     console.error("PATCH /seekers/vcs/share-default error:", err);
     return res.status(500).json({ error: "Failed to update default VC sharing selection" });
-  }
-});
-
-/**
- * @openapi
- * /seekers/me:
- *   get:
- *     summary: Get seeker (session-only)
- *     tags: [Seekers]
- *     parameters:
- *       - in: query
- *         name: did
- *         schema: { type: string }
- *       - in: query
- *         name: email
- *         schema: { type: string }
- *     responses:
- *       200:
- *         description: Seeker found
- *       404:
- *         description: Seeker not found
- */
-router.get("/me", async (req: Request, res: Response) => {
-  try {
-    const doc = await findSeekerBySession(req);
-    if (!doc) return res.status(404).json({ error: "Seeker not found" });
-    return res.json(toSeekerDTO(doc));
-  } catch (err) {
-    console.error("GET /seekers/me error:", err);
-    return res.status(500).json({ error: "Failed to fetch seeker" });
   }
 });
 
