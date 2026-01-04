@@ -12,6 +12,8 @@ import { guardRecruiterBootstrap } from "../middleware/guardRecruiterBootstrap";
 import { requireRecruiterOnboarded } from "../middleware/requireRecruiterOnboarded";
 import { syncRecruiterRoleFromRecruiterDoc } from "../middleware/syncRecruiterRoleFromRecruiterDoc";
 import { requireRoleStateIn, requireRoleActive } from "../middleware/rbac";
+import { requireLockedRole } from "../middleware/requireLockedRole";
+import { autoLockFromRoleState } from "../middleware/autoLockFromRoleState";
 
 const router = express.Router();
 
@@ -88,6 +90,8 @@ router.get("/public/:id", async (req, res) => {
 
 router.use(requireSession, requireUser);
 router.use(syncRecruiterRoleFromRecruiterDoc);    // badge.status -> roles.recruiter
+router.use(autoLockFromRoleState("recruiter"));
+router.use(requireLockedRole("recruiter"));
 // If role is none, only allow bootstrap endpoints
 router.use(
   guardRecruiterBootstrap([
@@ -169,6 +173,21 @@ router.post("/", async (req, res) => {
     });
 
     await recruiter.save();
+
+    if (req.user) {
+      if (!req.user.lockedRole) {
+        req.user.lockedRole = "recruiter";
+        await req.user.save();
+      } else if (req.user.lockedRole !== "recruiter") {
+        return res.status(409).json({
+          code: "ROLE_MISMATCH",
+          message: `This account is registered as ${req.user.lockedRole}.`,
+          lockedRole: req.user.lockedRole,
+          attemptedRole: "recruiter",
+        });
+      }
+    }
+
     return res.status(201).json(toRecruiterApi(recruiter));
   } catch (e) {
     return res.status(401).json({ error: "Unauthenticated" });
@@ -229,6 +248,24 @@ router.post("/onboarding", async (req, res) => {
 
     await recruiter.save();
     (req as any).recruiter = recruiter;
+
+    if (req.user) {
+      if (!req.user.lockedRole && recruiter.onboarded) {
+        req.user.lockedRole = "recruiter";
+      }
+
+      if (req.user.lockedRole && req.user.lockedRole !== "recruiter") {
+        return res.status(409).json({
+          code: "ROLE_MISMATCH",
+          message: `This account is registered as ${req.user.lockedRole}.`,
+          lockedRole: req.user.lockedRole,
+          attemptedRole: "recruiter",
+        });
+      }
+
+      req.user.roles.recruiter = "pending";
+      await req.user.save();
+    }
     return res.json(toRecruiterApi(recruiter));
   } catch (e) {
     return res.status(401).json({ error: "Unauthenticated" });

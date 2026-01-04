@@ -11,6 +11,8 @@ import { requireRoleStateIn, requireRoleActive } from "../middleware/rbac";
 import { syncSeekerRoleFromSeekerDoc } from "../middleware/syncSeekerRoleFromSeekerDoc";
 import { requireSeekerOnboarded } from "../middleware/requireSeekerOnboarded";
 import { mustGetIdentity, deriveDidFromSession, findSeekerBySession } from "../services/seekerIdentity";
+import { requireLockedRole } from "../middleware/requireLockedRole";
+import { autoLockFromRoleState } from "../middleware/autoLockFromRoleState";
 import crypto from "crypto";
 
 const router = Router();
@@ -19,7 +21,7 @@ const router = Router();
  * All seeker routes require an authenticated session.
  * Identity (did/email) is taken from the verified session, NOT client body/query.
  */
-router.use(requireSession, requireUser, syncSeekerRoleFromSeekerDoc);
+router.use(requireSession, requireUser, syncSeekerRoleFromSeekerDoc, autoLockFromRoleState("seeker"), requireLockedRole("seeker"));
 
 // Simple normaliser: lowercase + trim
 const norm = (s?: string | null) =>
@@ -265,6 +267,21 @@ router.post("/onboard",
       await doc.save();
 
       if (req.user) {
+
+        if (!req.user.lockedRole && doc.onboarded) {
+          req.user.lockedRole = "seeker";
+        }
+
+        // If already locked to something else, block (defense in depth)
+        if (req.user.lockedRole && req.user.lockedRole !== "seeker") {
+          return res.status(409).json({
+            code: "ROLE_MISMATCH",
+            message: `This account is registered as ${req.user.lockedRole}.`,
+            lockedRole: req.user.lockedRole,
+            attemptedRole: "seeker",
+          });
+        }
+
         req.user.roles.seeker = doc.onboarded ? "active" : "none";
         await req.user.save();
       }

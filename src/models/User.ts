@@ -12,6 +12,7 @@ export interface IUser extends Document {
   email?: string;                   // optional
   did?: string;                     // did:pkh... or did:privy...
   wallet_address?: string;
+  lockedRole?: Role;
 
   roles: {
     seeker: RoleState;
@@ -29,6 +30,7 @@ const UserSchema = new Schema<IUser>(
     email: { type: String, index: true },
     did: { type: String, index: true },
     wallet_address: { type: String, index: true },
+    lockedRole: { type: String, enum: ["seeker", "recruiter", "issuer"], index: true },
 
     roles: {
       seeker: { type: String, enum: ["none", "active", "pending", "rejected"], default: "none" },

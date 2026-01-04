@@ -59,6 +59,7 @@ router.get(
         email: user.email,
         wallet_address: user.wallet_address,
       },
+      lockedRole: user.lockedRole ?? null,
       roles,                // { seeker: "active" | ... }
       activeRoles,          // ["seeker", ...]
       pendingRoles,

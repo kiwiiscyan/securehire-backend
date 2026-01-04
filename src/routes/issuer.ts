@@ -19,10 +19,12 @@ import { mustGetSession, mustGetDid } from "../auth/identity";
 import { requireUser } from "../middleware/requireUser";
 import { syncIssuerRoleFromIssuerDoc } from "../middleware/syncIssuerRoleFromIssuerDoc";
 import { requireRoleStateIn, requireRoleActive } from "../middleware/rbac";
+import { requireLockedRole } from "../middleware/requireLockedRole";
+import { autoLockFromRoleState } from "../middleware/autoLockFromRoleState";
 
 const router = Router();
 
-router.use(requireSession, requireUser, syncIssuerRoleFromIssuerDoc);
+router.use(requireSession, requireUser, syncIssuerRoleFromIssuerDoc, autoLockFromRoleState("issuer"), requireLockedRole("issuer"));
 
 /**
  * Helper type: per-section structured claims that also carries credentialType.
@@ -790,15 +792,6 @@ router.get("/recruiters/badges",
         orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
       }
 
-      /*
-      if (issuerDid) {
-        const issuer = await Issuer.findOne({ did: issuerDid });
-        if (issuer?.orgName) {
-          orgNameFilter = issuer.orgName.toLowerCase().replace(/\s+/g, "");
-        }
-      }
-      */
-
       const recruitersRaw = await Recruiter.find({
         kycStatus: { $in: ["rejected", "approved"] }
       }).sort({ updatedAt: -1 });
@@ -1043,6 +1036,19 @@ router.post("/onboard",
       await issuerWithKey.save();
 
       if (req.user) {
+
+        if (!req.user.lockedRole && (issuerWithKey.onboarded ?? false)) {
+          req.user.lockedRole = "issuer";
+        }
+
+        if (req.user.lockedRole && req.user.lockedRole !== "issuer") {
+          return res.status(409).json({
+            code: "ROLE_MISMATCH",
+            message: `This account is registered as ${req.user.lockedRole}.`,
+            lockedRole: req.user.lockedRole,
+            attemptedRole: "issuer",
+          });
+        }
         req.user.roles.issuer = issuerWithKey.onboarded ? "active" : "none";
         await req.user.save();
       }
